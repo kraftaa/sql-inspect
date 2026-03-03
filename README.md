@@ -16,6 +16,7 @@ Current structured output includes:
 - `risks`
 - `suggestions`
 - `anti_patterns`
+- `findings` with `rule_id`, `severity`, `message`, `why_it_matters`, `evidence`
 - `estimated_cost_impact`
 - `confidence`
 
@@ -92,10 +93,15 @@ Provide exactly one of:
 
 - `--sql "<query>"`
 - `--file <path>`
+- `--dir <path>`
 
 Optional:
 
 - `--provider openai|bedrock` (default: `openai`)
+- `--glob <pattern>` for directory scans (default: `*.sql`)
+- `--config <path>` to load `sql-inspect.toml`
+- `--static-only` to skip the LLM and run deterministic checks only
+- `--fail-on low|medium|high` to exit non-zero when findings meet the threshold
 - `--json` to print raw JSON returned by the model
 
 ### OpenAI Example
@@ -120,6 +126,50 @@ cargo run -- --provider bedrock --file examples/query.sql
 
 ```bash
 cargo run -- --provider openai --sql "select * from orders o join customers c on o.customer_id = c.id where o.created_at >= current_date - interval '30 days'"
+```
+
+### Directory Scan Example
+
+Directory scanning currently runs in static-analysis mode so you can use it in CI without provider credentials.
+
+```bash
+cargo run -- --dir models --glob "*.sql" --fail-on high
+```
+
+### Static-Only Example
+
+```bash
+cargo run -- --file examples/query.sql --static-only
+```
+
+Tested result with the included sample query:
+
+- summary: static analysis for `examples/query.sql`
+- estimated cost impact: `low`
+- no findings for the current sample query
+
+### Config File Example
+
+Create `sql-inspect.toml` in the project root:
+
+```toml
+fail_on = "high"
+glob = "*.sql"
+suggest_limit_for_exploratory = true
+static_only = false
+```
+
+An example is included at `sql-inspect.toml.example`.
+
+## Tested Commands
+
+These commands were run successfully against the current repository:
+
+```bash
+cargo run -- --file examples/query.sql --static-only
+cargo run -- --dir examples --glob "*.sql" --fail-on high
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 ## Smoke Test Script

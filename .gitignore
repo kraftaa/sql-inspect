@@ -5,5 +5,6 @@ target/
 !.env.example
 !.env.sample
 !.env.template
+!sql-inspect.toml.example
 why-sql-inspect.md
 all-files.md
