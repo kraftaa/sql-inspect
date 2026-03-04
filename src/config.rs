@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct SqlInspectConfig {
+    pub dialect: Option<String>,
     pub fail_on: Option<String>,
     pub glob: Option<String>,
     pub suggest_limit_for_exploratory: Option<bool>,
@@ -55,11 +56,12 @@ mod tests {
         let path = tmp.join("sql-inspect.toml");
         std::fs::write(
             &path,
-            "fail_on = \"medium\"\nglob = \"*.sql\"\nsuggest_limit_for_exploratory = false\n",
+            "dialect = \"athena\"\nfail_on = \"medium\"\nglob = \"*.sql\"\nsuggest_limit_for_exploratory = false\n",
         )
         .expect("write config");
 
         let config = load_config(Some(&path)).expect("config should parse");
+        assert_eq!(config.dialect.as_deref(), Some("athena"));
         assert_eq!(config.fail_on.as_deref(), Some("medium"));
         assert_eq!(config.glob.as_deref(), Some("*.sql"));
         assert_eq!(config.suggest_limit_for_exploratory, Some(false));

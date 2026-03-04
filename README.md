@@ -24,6 +24,7 @@ Supports:
 
 - OpenAI (`/v1/responses`)
 - AWS Bedrock (`invoke_model`)
+- dialect-aware static analysis (`generic`, `athena`)
 
 Static checks currently detect patterns such as:
 
@@ -34,6 +35,12 @@ Static checks currently detect patterns such as:
 - `CROSS JOIN`
 
 The tool may also suggest adding `LIMIT` for likely ad hoc exploration queries, but missing `LIMIT` is not treated as a general anti-pattern.
+
+Athena mode adds heuristics such as:
+
+- no obvious partition/date filter
+- `ORDER BY` without `LIMIT`
+- `COUNT(DISTINCT ...)` suggestion toward `approx_distinct`
 
 ## Project Layout
 
@@ -98,6 +105,7 @@ Provide exactly one of:
 Optional:
 
 - `--provider openai|bedrock` (default: `openai`)
+- `--dialect generic|athena`
 - `--glob <pattern>` for directory scans (default: `*.sql`)
 - `--config <path>` to load `sql-inspect.toml`
 - `--static-only` to skip the LLM and run deterministic checks only
@@ -133,7 +141,7 @@ cargo run -- --provider openai --sql "select * from orders o join customers c on
 Directory scanning currently runs in static-analysis mode so you can use it in CI without provider credentials.
 
 ```bash
-cargo run -- --dir models --glob "*.sql" --fail-on high
+cargo run -- --dir models --dialect athena --glob "*.sql" --fail-on high
 ```
 
 ### Static-Only Example
@@ -153,6 +161,7 @@ Tested result with the included sample query:
 Create `sql-inspect.toml` in the project root:
 
 ```toml
+dialect = "athena"
 fail_on = "high"
 glob = "*.sql"
 suggest_limit_for_exploratory = true
@@ -167,7 +176,7 @@ These commands were run successfully against the current repository:
 
 ```bash
 cargo run -- --file examples/query.sql --static-only
-cargo run -- --dir examples --glob "*.sql" --fail-on high
+cargo run -- --dir examples --dialect athena --glob "*.sql" --fail-on high
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```

@@ -1,14 +1,22 @@
 use crate::prompt::{Finding, Severity};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialect {
+    Generic,
+    Athena,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AnalysisOptions {
     pub suggest_limit_for_exploratory: bool,
+    pub dialect: Dialect,
 }
 
 impl Default for AnalysisOptions {
     fn default() -> Self {
         Self {
             suggest_limit_for_exploratory: true,
+            dialect: Dialect::Generic,
         }
     }
 }
@@ -131,6 +139,59 @@ pub fn analyze_sql(sql: &str, options: AnalysisOptions) -> StaticAnalysis {
         score += 3;
     }
 
+    if matches!(options.dialect, Dialect::Athena) {
+        if tokens.contains(&"where") && !has_obvious_athena_partition_filter(&normalized) {
+            findings.push(Finding {
+                rule_id: "ATHENA_MISSING_PARTITION_FILTER".to_string(),
+                severity: Severity::Medium,
+                message: "No obvious Athena partition filter".to_string(),
+                why_it_matters:
+                    "Athena cost is tied to scanned bytes, so missing partition pruning can make queries much more expensive"
+                        .to_string(),
+                evidence: vec!["WHERE clause present but no obvious partition/date predicate detected".to_string()],
+            });
+            risks.push(
+                "Athena may scan more partitions than necessary without an obvious partition filter"
+                    .to_string(),
+            );
+            suggestions.push(
+                "Add a partition-aligned predicate such as ds/date/year/month/day when available"
+                    .to_string(),
+            );
+            score += 1;
+        }
+
+        if contains_sequence(&tokens, &["order", "by"]) && !tokens.contains(&"limit") {
+            findings.push(Finding {
+                rule_id: "ATHENA_ORDER_BY_WITHOUT_LIMIT".to_string(),
+                severity: Severity::Medium,
+                message: "ORDER BY without LIMIT".to_string(),
+                why_it_matters:
+                    "Athena may need a large global sort, which can be expensive on large datasets"
+                        .to_string(),
+                evidence: vec!["ORDER BY detected without LIMIT".to_string()],
+            });
+            risks.push("ORDER BY without LIMIT can force an expensive global sort in Athena".to_string());
+            suggestions.push("Add LIMIT if you only need the top rows, or sort later in a downstream step".to_string());
+            score += 1;
+        }
+
+        if normalized.contains("count(distinct") {
+            findings.push(Finding {
+                rule_id: "ATHENA_COUNT_DISTINCT".to_string(),
+                severity: Severity::Low,
+                message: "COUNT(DISTINCT ...)".to_string(),
+                why_it_matters:
+                    "Exact distinct counts can be expensive in Athena on large datasets"
+                        .to_string(),
+                evidence: vec!["COUNT(DISTINCT".to_string()],
+            });
+            suggestions.push(
+                "Consider approx_distinct if an approximate answer is acceptable".to_string(),
+            );
+        }
+    }
+
     let estimated_cost_impact = match score {
         0..=1 => "low",
         2..=4 => "medium",
@@ -165,10 +226,27 @@ fn contains_sequence(tokens: &[&str], pattern: &[&str]) -> bool {
     tokens.windows(pattern.len()).any(|window| window == pattern)
 }
 
+fn has_obvious_athena_partition_filter(normalized: &str) -> bool {
+    const PARTITION_HINTS: [&str; 10] = [
+        " ds ",
+        " date ",
+        "_date",
+        " event_date",
+        " created_date",
+        " partition_",
+        " year ",
+        " month ",
+        " day ",
+        " hour ",
+    ];
+
+    PARTITION_HINTS.iter().any(|hint| normalized.contains(hint))
+}
+
 #[cfg(test)]
 mod tests {
     use super::analyze_sql;
-    use super::AnalysisOptions;
+    use super::{AnalysisOptions, Dialect};
 
     #[test]
     fn detects_common_sql_anti_patterns() {
@@ -224,6 +302,7 @@ mod tests {
             sql,
             AnalysisOptions {
                 suggest_limit_for_exploratory: false,
+                dialect: Dialect::Generic,
             },
         );
 
@@ -239,5 +318,60 @@ mod tests {
         let analysis = analyze_sql(sql, AnalysisOptions::default());
 
         assert!(!analysis.findings.iter().any(|f| f.rule_id == "MISSING_WHERE"));
+    }
+
+    #[test]
+    fn athena_detects_missing_partition_filter() {
+        let sql = "SELECT user_id FROM events WHERE status = 'ok'";
+        let analysis = analyze_sql(
+            sql,
+            AnalysisOptions {
+                dialect: Dialect::Athena,
+                ..AnalysisOptions::default()
+            },
+        );
+
+        assert!(analysis
+            .findings
+            .iter()
+            .any(|f| f.rule_id == "ATHENA_MISSING_PARTITION_FILTER"));
+    }
+
+    #[test]
+    fn athena_detects_order_by_without_limit() {
+        let sql = "SELECT user_id FROM events WHERE ds = '2026-03-03' ORDER BY event_ts DESC";
+        let analysis = analyze_sql(
+            sql,
+            AnalysisOptions {
+                dialect: Dialect::Athena,
+                ..AnalysisOptions::default()
+            },
+        );
+
+        assert!(analysis
+            .findings
+            .iter()
+            .any(|f| f.rule_id == "ATHENA_ORDER_BY_WITHOUT_LIMIT"));
+    }
+
+    #[test]
+    fn athena_suggests_approx_distinct() {
+        let sql = "SELECT COUNT(DISTINCT user_id) FROM events WHERE ds = '2026-03-03'";
+        let analysis = analyze_sql(
+            sql,
+            AnalysisOptions {
+                dialect: Dialect::Athena,
+                ..AnalysisOptions::default()
+            },
+        );
+
+        assert!(analysis
+            .findings
+            .iter()
+            .any(|f| f.rule_id == "ATHENA_COUNT_DISTINCT"));
+        assert!(analysis
+            .suggestions
+            .iter()
+            .any(|s| s.contains("approx_distinct")));
     }
 }

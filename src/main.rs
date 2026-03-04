@@ -1,5 +1,5 @@
 use clap::{Parser, ValueEnum};
-use sql_ai_explainer::analyzer::{analyze_sql, AnalysisOptions, StaticAnalysis};
+use sql_ai_explainer::analyzer::{analyze_sql, AnalysisOptions, Dialect, StaticAnalysis};
 use sql_ai_explainer::config::{load_config, SqlInspectConfig};
 use sql_ai_explainer::error::AppError;
 use sql_ai_explainer::prompt::{
@@ -23,6 +23,12 @@ enum SeverityArg {
     High,
 }
 
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum DialectArg {
+    Generic,
+    Athena,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "sql-ai-explainer")]
 struct Args {
@@ -40,6 +46,9 @@ struct Args {
 
     #[arg(long, default_value = "*.sql")]
     glob: String,
+
+    #[arg(long, value_enum)]
+    dialect: Option<DialectArg>,
 
     #[arg(long)]
     config: Option<PathBuf>,
@@ -105,6 +114,17 @@ fn config_fail_on(config: &SqlInspectConfig) -> Option<Severity> {
 fn analysis_options(config: &SqlInspectConfig) -> AnalysisOptions {
     AnalysisOptions {
         suggest_limit_for_exploratory: config.suggest_limit_for_exploratory.unwrap_or(true),
+        dialect: match config.dialect.as_deref() {
+            Some("athena") => Dialect::Athena,
+            _ => Dialect::Generic,
+        },
+    }
+}
+
+fn cli_dialect(arg: DialectArg) -> Dialect {
+    match arg {
+        DialectArg::Generic => Dialect::Generic,
+        DialectArg::Athena => Dialect::Athena,
     }
 }
 
@@ -400,11 +420,11 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     };
 
-    let threshold = args
-        .fail_on
-        .map(to_severity)
-        .or_else(|| config_fail_on(&config));
-    let options = analysis_options(&config);
+    let threshold = args.fail_on.map(to_severity).or_else(|| config_fail_on(&config));
+    let mut options = analysis_options(&config);
+    if let Some(dialect) = args.dialect {
+        options.dialect = cli_dialect(dialect);
+    }
     let static_only = args.static_only
         || config.static_only.unwrap_or(false)
         || matches!(input, InputMode::Dir(_));
@@ -476,7 +496,7 @@ async fn main() -> Result<(), anyhow::Error> {
 mod tests {
     use super::{
         collect_sql_files, matches_pattern, merge_static_analysis, read_input, render_explanation,
-        should_fail, Args, InputMode, ProviderArg, SeverityArg,
+        should_fail, Args, DialectArg, InputMode, ProviderArg, SeverityArg,
     };
     use clap::Parser;
     use sql_ai_explainer::analyzer::{analyze_sql, AnalysisOptions};
@@ -500,6 +520,8 @@ mod tests {
             "sql-ai-explainer",
             "--dir",
             "models",
+            "--dialect",
+            "athena",
             "--glob",
             "*.sql",
             "--fail-on",
@@ -508,6 +530,7 @@ mod tests {
         .expect("args should parse");
 
         assert_eq!(args.dir.as_deref(), Some(Path::new("models")));
+        assert!(matches!(args.dialect, Some(DialectArg::Athena)));
         assert!(matches!(args.fail_on, Some(SeverityArg::Medium)));
     }
 
@@ -519,6 +542,7 @@ mod tests {
             file: None,
             dir: None,
             glob: "*.sql".to_string(),
+            dialect: None,
             config: None,
             static_only: false,
             fail_on: None,
@@ -537,6 +561,7 @@ mod tests {
             file: Some(PathBuf::from("examples/query.sql")),
             dir: None,
             glob: "*.sql".to_string(),
+            dialect: None,
             config: None,
             static_only: false,
             fail_on: None,
@@ -558,6 +583,7 @@ mod tests {
             file: None,
             dir: Some(PathBuf::from("examples")),
             glob: "*.sql".to_string(),
+            dialect: None,
             config: None,
             static_only: false,
             fail_on: None,
@@ -576,6 +602,7 @@ mod tests {
             file: None,
             dir: None,
             glob: "*.sql".to_string(),
+            dialect: None,
             config: None,
             static_only: false,
             fail_on: None,

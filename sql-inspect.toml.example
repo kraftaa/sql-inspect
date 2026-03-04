@@ -1,3 +1,4 @@
+dialect = "athena"
 fail_on = "high"
 glob = "*.sql"
 suggest_limit_for_exploratory = true
