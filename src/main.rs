@@ -2,6 +2,7 @@ use clap::{Parser, ValueEnum};
 use sql_ai_explainer::analyzer::{analyze_sql, AnalysisOptions, Dialect, StaticAnalysis};
 use sql_ai_explainer::config::{load_config, SqlInspectConfig};
 use sql_ai_explainer::error::AppError;
+use sql_ai_explainer::insights::{explain_query, extract_lineage, extract_tables};
 use sql_ai_explainer::prompt::{
     build_prompt, parse_sql_explanation, Finding, Severity, SqlExplanation,
 };
@@ -29,9 +30,30 @@ enum DialectArg {
     Athena,
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum Commands {
+    Lineage {
+        file: PathBuf,
+    },
+    Tables {
+        file: PathBuf,
+    },
+    Explain {
+        file: PathBuf,
+    },
+    Analyze {
+        dir: PathBuf,
+        #[arg(long, default_value = "*.sql")]
+        glob: String,
+    },
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "sql-ai-explainer")]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     #[arg(long, value_enum, default_value = "openai")]
     provider: ProviderArg,
 
@@ -227,6 +249,8 @@ fn apply_rule_controls(parsed: &mut SqlExplanation, config: &SqlInspectConfig) {
     for message in disabled_messages {
         parsed.anti_patterns.retain(|item| item != &message);
     }
+
+    recalculate_cost_impact(parsed);
 }
 
 fn cost_rank(value: &str) -> u8 {
@@ -236,6 +260,32 @@ fn cost_rank(value: &str) -> u8 {
         "high" => 3,
         _ => 0,
     }
+}
+
+fn severity_label(value: &Severity) -> &'static str {
+    match value {
+        Severity::Low => "LOW",
+        Severity::Medium => "MEDIUM",
+        Severity::High => "HIGH",
+        Severity::Unknown => "UNKNOWN",
+    }
+}
+
+fn recalculate_cost_impact(parsed: &mut SqlExplanation) {
+    let max_rank = parsed
+        .findings
+        .iter()
+        .map(|f| f.severity.rank())
+        .max()
+        .unwrap_or(0);
+
+    parsed.estimated_cost_impact = match max_rank {
+        0 => "low",
+        1 => "low",
+        2 => "medium",
+        _ => "high",
+    }
+    .to_string();
 }
 
 fn render_explanation(parsed: &SqlExplanation) -> String {
@@ -262,7 +312,7 @@ fn render_explanation(parsed: &SqlExplanation) -> String {
         out.push_str("\nFindings:\n");
         for finding in &parsed.findings {
             out.push_str(" - [");
-            out.push_str(&format!("{:?}", finding.severity).to_uppercase());
+            out.push_str(severity_label(&finding.severity));
             out.push_str("] ");
             out.push_str(&finding.rule_id);
             out.push_str(": ");
@@ -333,7 +383,7 @@ fn render_scan_report(results: &[FileReport]) -> String {
         out.push('\n');
         for finding in &result.findings {
             out.push_str("  - [");
-            out.push_str(&format!("{:?}", finding.severity).to_uppercase());
+            out.push_str(severity_label(&finding.severity));
             out.push_str("] ");
             out.push_str(&finding.rule_id);
             out.push_str(": ");
@@ -444,10 +494,124 @@ fn matches_pattern(path: &Path, pattern: &str) -> bool {
     file_name == pattern
 }
 
+fn read_sql_file(path: &Path) -> anyhow::Result<String> {
+    Ok(std::fs::read_to_string(path)?)
+}
+
+fn render_lineage(path: &Path, sql: &str) -> String {
+    let lineage = extract_lineage(sql);
+    let mut out = String::new();
+    out.push_str(&format!("{}\n", path.display()));
+    for item in lineage {
+        out.push_str(&item.output);
+        out.push('\n');
+        out.push_str(" └─ ");
+        out.push_str(&item.expression);
+        out.push('\n');
+    }
+    out
+}
+
+fn render_tables(sql: &str) -> String {
+    let tables = extract_tables(sql);
+    let mut out = String::new();
+    out.push_str("Tables used:\n");
+    for table in tables {
+        out.push_str("- ");
+        out.push_str(&table);
+        out.push('\n');
+    }
+    out
+}
+
+fn render_query_explanation(sql: &str) -> String {
+    let explanation = explain_query(sql);
+    let mut out = String::new();
+    out.push_str("Purpose: ");
+    out.push_str(&explanation.purpose);
+    out.push('\n');
+
+    out.push_str("Tables: ");
+    if explanation.tables.is_empty() {
+        out.push_str("unknown");
+    } else {
+        out.push_str(&explanation.tables.join(", "));
+    }
+    out.push('\n');
+
+    out.push_str("Aggregation: ");
+    if explanation.aggregations.is_empty() {
+        out.push_str("none");
+    } else {
+        out.push_str(&explanation.aggregations.join(", "));
+    }
+    out.push('\n');
+    out
+}
+
+fn render_folder_summary(
+    file_count: usize,
+    counts: &std::collections::BTreeMap<String, usize>,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Analyzed {} SQL files\n", file_count));
+    out.push_str("Warnings:\n");
+    if counts.is_empty() {
+        out.push_str("- none\n");
+    } else {
+        for (rule, count) in counts {
+            out.push_str(&format!("- {} {}\n", count, rule));
+        }
+    }
+    out
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
     let config = load_config(args.config.as_deref())?;
+
+    if let Some(command) = &args.command {
+        match command {
+            Commands::Lineage { file } => {
+                let sql = read_sql_file(file)?;
+                print!("{}", render_lineage(file, &sql));
+                return Ok(());
+            }
+            Commands::Tables { file } => {
+                let sql = read_sql_file(file)?;
+                print!("{}", render_tables(&sql));
+                return Ok(());
+            }
+            Commands::Explain { file } => {
+                let sql = read_sql_file(file)?;
+                print!("{}", render_query_explanation(&sql));
+                return Ok(());
+            }
+            Commands::Analyze { dir, glob } => {
+                let mut options = analysis_options(&config);
+                if let Some(dialect) = args.dialect {
+                    options.dialect = cli_dialect(dialect);
+                }
+                let files = collect_sql_files(dir, glob)?;
+                let mut counts = std::collections::BTreeMap::<String, usize>::new();
+
+                for file in &files {
+                    let sql = std::fs::read_to_string(file)?;
+                    let analysis = analyze_sql(&sql, options);
+                    let mut parsed = build_static_explanation(&analysis);
+                    apply_rule_controls(&mut parsed, &config);
+                    for finding in &parsed.findings {
+                        *counts.entry(finding.rule_id.clone()).or_insert(0) += 1;
+                    }
+                }
+
+                print!("{}", render_folder_summary(files.len(), &counts));
+                return Ok(());
+            }
+        }
+    }
+
     let input = match read_input(&args) {
         Ok(input) => input,
         Err(e) => {
@@ -538,7 +702,8 @@ async fn main() -> Result<(), anyhow::Error> {
 mod tests {
     use super::{
         apply_rule_controls, collect_sql_files, matches_pattern, merge_static_analysis, read_input,
-        render_explanation, should_fail, Args, DialectArg, InputMode, ProviderArg, SeverityArg,
+        render_explanation, render_query_explanation, render_tables, should_fail, Args, Commands,
+        DialectArg, InputMode, ProviderArg, SeverityArg,
     };
     use clap::Parser;
     use sql_ai_explainer::analyzer::{analyze_sql, AnalysisOptions};
@@ -554,8 +719,16 @@ mod tests {
 
         assert!(matches!(args.provider, ProviderArg::Openai));
         assert_eq!(args.sql.as_deref(), Some("select 1"));
+        assert!(args.command.is_none());
         assert!(args.file.is_none());
         assert!(!args.json);
+    }
+
+    #[test]
+    fn args_parse_tables_subcommand() {
+        let args = Args::try_parse_from(["sql-ai-explainer", "tables", "examples/query.sql"])
+            .expect("subcommand args should parse");
+        assert!(matches!(args.command, Some(Commands::Tables { .. })));
     }
 
     #[test]
@@ -581,6 +754,7 @@ mod tests {
     #[test]
     fn read_input_accepts_inline_sql() {
         let args = Args {
+            command: None,
             provider: ProviderArg::Openai,
             sql: Some("select 1".to_string()),
             file: None,
@@ -600,6 +774,7 @@ mod tests {
     #[test]
     fn read_input_reads_file() {
         let args = Args {
+            command: None,
             provider: ProviderArg::Openai,
             sql: None,
             file: Some(PathBuf::from("examples/query.sql")),
@@ -622,6 +797,7 @@ mod tests {
     #[test]
     fn read_input_accepts_directory() {
         let args = Args {
+            command: None,
             provider: ProviderArg::Openai,
             sql: None,
             file: None,
@@ -641,6 +817,7 @@ mod tests {
     #[test]
     fn read_input_rejects_missing_input() {
         let args = Args {
+            command: None,
             provider: ProviderArg::Openai,
             sql: None,
             file: None,
@@ -687,6 +864,21 @@ mod tests {
         assert!(rendered.contains("Findings:"));
         assert!(rendered.contains("[HIGH] SELECT_STAR: SELECT *"));
         assert!(rendered.contains("Evidence: SELECT *"));
+    }
+
+    #[test]
+    fn render_tables_lists_detected_tables() {
+        let output =
+            render_tables("SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id");
+        assert!(output.contains("orders"));
+        assert!(output.contains("customers"));
+    }
+
+    #[test]
+    fn render_query_explanation_contains_purpose() {
+        let output = render_query_explanation("SELECT SUM(amount) AS revenue FROM orders");
+        assert!(output.contains("Purpose:"));
+        assert!(output.contains("Aggregation: SUM"));
     }
 
     #[test]

@@ -139,6 +139,38 @@ pub fn analyze_sql(sql: &str, options: AnalysisOptions) -> StaticAnalysis {
         score += 3;
     }
 
+    if join_count > 0
+        && !normalized.contains("cross join")
+        && !tokens.contains(&"on")
+        && !tokens.contains(&"using")
+    {
+        findings.push(Finding {
+            rule_id: "POSSIBLE_CARTESIAN_JOIN".to_string(),
+            severity: Severity::High,
+            message: "JOIN without ON/USING".to_string(),
+            why_it_matters: "A JOIN without a join condition can behave like a Cartesian product"
+                .to_string(),
+            evidence: vec!["JOIN found but no ON/USING detected".to_string()],
+        });
+        anti_patterns.push("Possible Cartesian join".to_string());
+        risks.push("JOIN without condition may multiply rows and query cost".to_string());
+        suggestions.push("Add explicit ON/USING join predicates".to_string());
+        score += 3;
+    }
+
+    if normalized.contains(" in (select") || normalized.contains(" in (\nselect") {
+        findings.push(Finding {
+            rule_id: "IN_SUBQUERY".to_string(),
+            severity: Severity::Low,
+            message: "IN (SELECT ...)".to_string(),
+            why_it_matters:
+                "IN subqueries can be less efficient than equivalent JOIN/EXISTS patterns"
+                    .to_string(),
+            evidence: vec!["IN (SELECT ...) detected".to_string()],
+        });
+        suggestions.push("Consider replacing IN subquery with JOIN or EXISTS".to_string());
+    }
+
     if matches!(options.dialect, Dialect::Athena) {
         if tokens.contains(&"where") && !has_obvious_athena_partition_filter(&normalized) {
             findings.push(Finding {
@@ -171,8 +203,13 @@ pub fn analyze_sql(sql: &str, options: AnalysisOptions) -> StaticAnalysis {
                         .to_string(),
                 evidence: vec!["ORDER BY detected without LIMIT".to_string()],
             });
-            risks.push("ORDER BY without LIMIT can force an expensive global sort in Athena".to_string());
-            suggestions.push("Add LIMIT if you only need the top rows, or sort later in a downstream step".to_string());
+            risks.push(
+                "ORDER BY without LIMIT can force an expensive global sort in Athena".to_string(),
+            );
+            suggestions.push(
+                "Add LIMIT if you only need the top rows, or sort later in a downstream step"
+                    .to_string(),
+            );
             score += 1;
         }
 
@@ -223,7 +260,9 @@ fn looks_exploratory_select(tokens: &[&str], join_count: usize) -> bool {
 }
 
 fn contains_sequence(tokens: &[&str], pattern: &[&str]) -> bool {
-    tokens.windows(pattern.len()).any(|window| window == pattern)
+    tokens
+        .windows(pattern.len())
+        .any(|window| window == pattern)
 }
 
 fn has_obvious_athena_partition_filter(normalized: &str) -> bool {
@@ -317,7 +356,10 @@ mod tests {
         let sql = "SELECT id\nFROM orders\nWHERE created_at >= CURRENT_DATE - INTERVAL '7 days'";
         let analysis = analyze_sql(sql, AnalysisOptions::default());
 
-        assert!(!analysis.findings.iter().any(|f| f.rule_id == "MISSING_WHERE"));
+        assert!(!analysis
+            .findings
+            .iter()
+            .any(|f| f.rule_id == "MISSING_WHERE"));
     }
 
     #[test]
@@ -373,5 +415,22 @@ mod tests {
             .suggestions
             .iter()
             .any(|s| s.contains("approx_distinct")));
+    }
+
+    #[test]
+    fn detects_possible_cartesian_join() {
+        let sql = "SELECT * FROM orders o JOIN customers c";
+        let analysis = analyze_sql(sql, AnalysisOptions::default());
+        assert!(analysis
+            .findings
+            .iter()
+            .any(|f| f.rule_id == "POSSIBLE_CARTESIAN_JOIN"));
+    }
+
+    #[test]
+    fn detects_in_subquery_pattern() {
+        let sql = "SELECT id FROM orders WHERE customer_id IN (SELECT id FROM customers)";
+        let analysis = analyze_sql(sql, AnalysisOptions::default());
+        assert!(analysis.findings.iter().any(|f| f.rule_id == "IN_SUBQUERY"));
     }
 }

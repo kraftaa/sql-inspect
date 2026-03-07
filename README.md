@@ -20,6 +20,13 @@ Current structured output includes:
 - `estimated_cost_impact`
 - `confidence`
 
+Additional CLI features:
+
+- `lineage <file>`: basic column lineage extraction
+- `tables <file>`: table dependency extraction
+- `explain <file>`: compact query explanation
+- `analyze <dir>`: folder-level static analysis summary
+
 Supports:
 
 - OpenAI (`/v1/responses`)
@@ -33,6 +40,8 @@ Static checks currently detect patterns such as:
 - multiple joins / wide joins
 - leading wildcard `LIKE '%x'`
 - `CROSS JOIN`
+- possible Cartesian join (`JOIN` without `ON/USING`)
+- `IN (SELECT ...)` subquery suggestion
 
 The tool may also suggest adding `LIMIT` for likely ad hoc exploration queries, but missing `LIMIT` is not treated as a general anti-pattern.
 
@@ -112,6 +121,13 @@ Optional:
 - `--fail-on low|medium|high` to exit non-zero when findings meet the threshold
 - `--json` to print raw JSON returned by the model
 
+Subcommands:
+
+- `sql-inspect lineage <file>`
+- `sql-inspect tables <file>`
+- `sql-inspect explain <file>`
+- `sql-inspect analyze <dir> --glob "*.sql"`
+
 ### OpenAI Example
 
 ```bash
@@ -142,6 +158,12 @@ Directory scanning currently runs in static-analysis mode so you can use it in C
 
 ```bash
 cargo run -- --dir models --dialect athena --glob "*.sql" --fail-on high
+```
+
+Equivalent subcommand form:
+
+```bash
+cargo run -- analyze models --glob "*.sql"
 ```
 
 ### Static-Only Example
@@ -202,6 +224,10 @@ These commands were run successfully against the current repository:
 ```bash
 cargo run -- --file examples/query.sql --static-only
 cargo run -- --dir examples --dialect athena --glob "*.sql" --fail-on high
+cargo run -- lineage examples/query.sql
+cargo run -- tables examples/query.sql
+cargo run -- explain examples/query.sql
+cargo run -- analyze examples --glob "*.sql"
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
 ```
