@@ -36,9 +36,13 @@ enum DialectArg {
 enum Commands {
     Lineage {
         file: PathBuf,
+        #[arg(long)]
+        column: Option<String>,
     },
     Risk {
         file: PathBuf,
+        #[arg(long, default_value_t = false)]
+        summary_only: bool,
     },
     Guard {
         file: PathBuf,
@@ -80,6 +84,10 @@ enum Commands {
         dir: PathBuf,
         #[arg(long, default_value = "*.sql")]
         glob: String,
+        #[arg(long, default_value_t = false, conflicts_with = "markdown")]
+        ci: bool,
+        #[arg(long, default_value_t = false, conflicts_with = "ci")]
+        markdown: bool,
     },
 }
 
@@ -213,6 +221,8 @@ struct PrFileDelta {
 
 #[derive(Debug, serde::Serialize)]
 struct PrReviewReport {
+    base: String,
+    head: String,
     summary: PrReviewSummary,
     files: Vec<PrFileDelta>,
 }
@@ -825,18 +835,38 @@ fn read_sql_file(path: &Path) -> anyhow::Result<String> {
     Ok(std::fs::read_to_string(path)?)
 }
 
-fn render_lineage(path: &Path, sql: &str) -> String {
+fn render_lineage(path: &Path, sql: &str, column: Option<&str>) -> String {
     let report = extract_lineage_report(sql);
     let mut out = String::new();
     out.push_str(&format!("{}\n", path.display()));
 
+    let projections = if let Some(column) = column {
+        report
+            .projections
+            .into_iter()
+            .filter(|item| item.output.eq_ignore_ascii_case(column))
+            .collect::<Vec<_>>()
+    } else {
+        report.projections
+    };
+
     out.push_str("Projections:\n");
-    for item in report.projections {
-        out.push_str(&item.output);
-        out.push('\n');
-        out.push_str(" └─ ");
-        out.push_str(&item.expression);
-        out.push('\n');
+    if projections.is_empty() {
+        if let Some(column) = column {
+            out.push_str("No lineage found for column: ");
+            out.push_str(column);
+            out.push('\n');
+        } else {
+            out.push_str("none\n");
+        }
+    } else {
+        for item in projections {
+            out.push_str(&item.output);
+            out.push('\n');
+            out.push_str(" └─ ");
+            out.push_str(&item.expression);
+            out.push('\n');
+        }
     }
 
     if !report.filters.is_empty() {
@@ -1178,6 +1208,27 @@ fn render_risk_report(report: &RiskReport) -> String {
     out
 }
 
+fn render_risk_summary(report: &RiskReport) -> String {
+    let mut out = String::new();
+    out.push_str("SQL Inspect Risk\n");
+    out.push_str("File: ");
+    out.push_str(&report.file);
+    out.push('\n');
+    out.push_str("Risk: ");
+    out.push_str(&report.risk_score);
+    out.push('\n');
+    out.push_str("Estimated scan: ");
+    out.push_str(&report.estimated_scan);
+    out.push('\n');
+    out.push_str("Top reasons:\n");
+    for reason in report.reasons.iter().take(3) {
+        out.push_str("- ");
+        out.push_str(reason);
+        out.push('\n');
+    }
+    out
+}
+
 fn render_folder_summary_with_verbose(
     summary: &RepoSummary,
     counts: &std::collections::BTreeMap<String, usize>,
@@ -1307,6 +1358,12 @@ fn scan_delta_label(from: Option<u64>, to: Option<u64>) -> String {
 fn render_pr_review(report: &PrReviewReport) -> String {
     let mut out = String::new();
     out.push_str("SQL Inspect PR Review\n");
+    out.push_str("Base: ");
+    out.push_str(&report.base);
+    out.push('\n');
+    out.push_str("Head: ");
+    out.push_str(&report.head);
+    out.push_str("\n\n");
     out.push_str("PR status: ");
     out.push_str(&report.summary.status);
     out.push_str("\n\n");
@@ -1389,6 +1446,139 @@ fn render_pr_review(report: &PrReviewReport) -> String {
     out
 }
 
+fn render_pr_review_ci(report: &PrReviewReport) -> String {
+    let mut out = String::new();
+    out.push_str("PR status: ");
+    out.push_str(&report.summary.status);
+    out.push('\n');
+    out.push_str(&format!(
+        "Changed SQL files: {}\n",
+        report.summary.changed_sql_files
+    ));
+    out.push_str(&format!(
+        "New HIGH-risk queries: {}\n",
+        report.summary.new_high_risk_queries
+    ));
+    out.push_str(&format!(
+        "Partition filter regressions: {}\n",
+        report.summary.partition_filter_regressions
+    ));
+    out.push_str(&format!(
+        "ORDER BY without LIMIT regressions: {}\n",
+        report.summary.order_by_without_limit_regressions
+    ));
+    out.push_str(&format!(
+        "Join amplification regressions: {}\n",
+        report.summary.possible_join_amplification_regressions
+    ));
+    out.push_str(&format!(
+        "Files with higher estimated scan: {}\n",
+        report.summary.scan_cost_increase_files
+    ));
+    out
+}
+
+fn render_pr_review_markdown(report: &PrReviewReport) -> String {
+    let mut out = String::new();
+    out.push_str("# SQL Inspect PR Review\n\n");
+    out.push_str("## Summary\n\n");
+    out.push_str("- **Base:** `");
+    out.push_str(&report.base);
+    out.push_str("`\n");
+    out.push_str("- **Head:** `");
+    out.push_str(&report.head);
+    out.push_str("`\n");
+    out.push_str("- **PR status:** **");
+    out.push_str(&report.summary.status);
+    out.push_str("**\n");
+    out.push_str("- **Changed SQL files:** ");
+    out.push_str(&report.summary.changed_sql_files.to_string());
+    out.push('\n');
+    out.push_str("- **New HIGH-risk queries:** ");
+    out.push_str(&report.summary.new_high_risk_queries.to_string());
+    out.push('\n');
+    out.push_str("- **Partition filter regressions:** ");
+    out.push_str(&report.summary.partition_filter_regressions.to_string());
+    out.push('\n');
+    out.push_str("- **ORDER BY without LIMIT regressions:** ");
+    out.push_str(
+        &report
+            .summary
+            .order_by_without_limit_regressions
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("- **Join amplification regressions:** ");
+    out.push_str(
+        &report
+            .summary
+            .possible_join_amplification_regressions
+            .to_string(),
+    );
+    out.push('\n');
+    out.push_str("- **Files with higher estimated scan:** ");
+    out.push_str(&report.summary.scan_cost_increase_files.to_string());
+    out.push_str("\n\n");
+
+    out.push_str("## Result\n\n");
+    if report.summary.status == "PASS" {
+        out.push_str("No new SQL risk regressions detected.\n\n");
+    } else {
+        out.push_str("This PR introduces new SQL risk regressions.\n\n");
+    }
+
+    if report.files.is_empty() {
+        return out;
+    }
+
+    out.push_str("## File Review\n\n");
+    for file in &report.files {
+        out.push_str("### `");
+        out.push_str(&file.path);
+        out.push_str("`\n\n");
+        out.push_str("- **Risk:** ");
+        out.push_str(&file.previous_risk);
+        out.push_str(" -> ");
+        out.push_str(&file.current_risk);
+        out.push_str(" (`");
+        out.push_str(&file.risk_trend);
+        out.push_str("`)\n");
+        out.push_str("- **Estimated scan:** ");
+        out.push_str(&file.estimated_scan_from);
+        out.push_str(" -> ");
+        out.push_str(&file.estimated_scan_to);
+        out.push_str(" (`");
+        out.push_str(&file.scan_delta);
+        out.push_str("`)\n");
+
+        if !file.new_issues.is_empty() {
+            out.push_str("- **New findings:** ");
+            out.push_str(&file.new_issues.join(", "));
+            out.push('\n');
+        }
+        if !file.resolved_issues.is_empty() {
+            out.push_str("- **Resolved:** ");
+            out.push_str(&file.resolved_issues.join(", "));
+            out.push('\n');
+        }
+        if !file.persistent_risk_factors.is_empty() {
+            out.push_str("- **Still risky because:** ");
+            out.push_str(&file.persistent_risk_factors.join(", "));
+            out.push('\n');
+        }
+        if file.new_issues.is_empty()
+            && file.resolved_issues.is_empty()
+            && file.persistent_risk_factors.is_empty()
+        {
+            out.push_str("- **Notes:** no rule-level changes detected\n");
+        }
+
+        out.push('\n');
+    }
+
+    out
+}
+
 fn render_guard_report(report: &GuardReport) -> String {
     let mut out = String::new();
     out.push_str("SQL Inspect Guard\n");
@@ -1431,12 +1621,12 @@ async fn main() -> Result<(), anyhow::Error> {
 
     if let Some(command) = &args.command {
         match command {
-            Commands::Lineage { file } => {
+            Commands::Lineage { file, column } => {
                 let sql = read_sql_file(file)?;
-                print!("{}", render_lineage(file, &sql));
+                print!("{}", render_lineage(file, &sql, column.as_deref()));
                 return Ok(());
             }
-            Commands::Risk { file } => {
+            Commands::Risk { file, summary_only } => {
                 let sql = read_sql_file(file)?;
                 let mut options = analysis_options(&config);
                 if let Some(dialect) = args.dialect {
@@ -1450,6 +1640,8 @@ async fn main() -> Result<(), anyhow::Error> {
                 );
                 if args.json {
                     println!("{}", serde_json::to_string_pretty(&report)?);
+                } else if *summary_only {
+                    print!("{}", render_risk_summary(&report));
                 } else {
                     print!("{}", render_risk_report(&report));
                 }
@@ -1672,6 +1864,8 @@ async fn main() -> Result<(), anyhow::Error> {
                 head,
                 dir,
                 glob,
+                ci,
+                markdown,
             } => {
                 let mut options = analysis_options(&config);
                 if let Some(dialect) = args.dialect {
@@ -1800,11 +1994,17 @@ async fn main() -> Result<(), anyhow::Error> {
                 }
 
                 let report = PrReviewReport {
+                    base: base.clone(),
+                    head: head.clone(),
                     summary,
                     files: reports,
                 };
                 if args.json {
                     println!("{}", serde_json::to_string_pretty(&report)?);
+                } else if *ci {
+                    print!("{}", render_pr_review_ci(&report));
+                } else if *markdown {
+                    print!("{}", render_pr_review_markdown(&report));
                 } else {
                     print!("{}", render_pr_review(&report));
                 }
@@ -1907,8 +2107,9 @@ mod tests {
     use super::{
         apply_inline_suppressions_to_analysis, apply_rule_controls, collect_sql_files,
         extract_suppressed_rules, guard_block_reasons, matches_pattern, merge_static_analysis,
-        read_input, render_explanation, render_guard_report, render_pr_review,
-        render_query_explanation, render_tables, risk_score, should_fail, simulate_query, Args,
+        read_input, render_explanation, render_guard_report, render_lineage, render_pr_review,
+        render_pr_review_ci, render_pr_review_markdown, render_query_explanation,
+        render_risk_summary, render_tables, risk_score, should_fail, simulate_query, Args,
         Commands, DialectArg, GuardReport, InputMode, PrFileDelta, PrReviewReport, PrReviewSummary,
         ProviderArg, SeverityArg,
     };
@@ -1943,6 +2144,24 @@ mod tests {
         let args = Args::try_parse_from(["sql-inspect", "risk", "examples/query.sql"])
             .expect("subcommand args should parse");
         assert!(matches!(args.command, Some(Commands::Risk { .. })));
+    }
+
+    #[test]
+    fn args_parse_risk_summary_only() {
+        let args = Args::try_parse_from([
+            "sql-inspect",
+            "risk",
+            "examples/query.sql",
+            "--summary-only",
+        ])
+        .expect("risk summary-only args should parse");
+        assert!(matches!(
+            args.command,
+            Some(Commands::Risk {
+                summary_only: true,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1989,6 +2208,46 @@ mod tests {
         ])
         .expect("pr-review args should parse");
         assert!(matches!(args.command, Some(Commands::PrReview { .. })));
+    }
+
+    #[test]
+    fn args_parse_pr_review_ci() {
+        let args = Args::try_parse_from(["sql-inspect", "pr-review", "--base", "main", "--ci"])
+            .expect("pr-review ci args should parse");
+        assert!(matches!(
+            args.command,
+            Some(Commands::PrReview { ci: true, .. })
+        ));
+    }
+
+    #[test]
+    fn args_parse_pr_review_markdown() {
+        let args =
+            Args::try_parse_from(["sql-inspect", "pr-review", "--base", "main", "--markdown"])
+                .expect("pr-review markdown args should parse");
+        assert!(matches!(
+            args.command,
+            Some(Commands::PrReview { markdown: true, .. })
+        ));
+    }
+
+    #[test]
+    fn args_parse_lineage_column() {
+        let args = Args::try_parse_from([
+            "sql-inspect",
+            "lineage",
+            "examples/revenue.sql",
+            "--column",
+            "revenue",
+        ])
+        .expect("lineage column args should parse");
+        assert!(matches!(
+            args.command,
+            Some(Commands::Lineage {
+                column: Some(_),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2467,6 +2726,8 @@ mod tests {
     #[test]
     fn render_pr_review_includes_pass_status() {
         let report = PrReviewReport {
+            base: "HEAD~1".to_string(),
+            head: "HEAD".to_string(),
             summary: PrReviewSummary {
                 status: "PASS".to_string(),
                 changed_sql_files: 1,
@@ -2492,7 +2753,93 @@ mod tests {
 
         let rendered = render_pr_review(&report);
         assert!(rendered.contains("PR status: PASS"));
+        assert!(rendered.contains("Base: HEAD~1"));
         assert!(rendered.contains("Still risky because:"));
+    }
+
+    #[test]
+    fn render_pr_review_ci_is_compact() {
+        let report = PrReviewReport {
+            base: "main".to_string(),
+            head: "HEAD".to_string(),
+            summary: PrReviewSummary {
+                status: "FAIL".to_string(),
+                changed_sql_files: 3,
+                new_high_risk_queries: 1,
+                partition_filter_regressions: 1,
+                order_by_without_limit_regressions: 0,
+                possible_join_amplification_regressions: 1,
+                scan_cost_increase_files: 2,
+            },
+            files: vec![],
+        };
+
+        let rendered = render_pr_review_ci(&report);
+        assert!(rendered.contains("PR status: FAIL"));
+        assert!(rendered.contains("Changed SQL files: 3"));
+        assert!(!rendered.contains("File:"));
+    }
+
+    #[test]
+    fn render_pr_review_markdown_uses_markdown_sections() {
+        let report = PrReviewReport {
+            base: "main".to_string(),
+            head: "HEAD".to_string(),
+            summary: PrReviewSummary {
+                status: "PASS".to_string(),
+                changed_sql_files: 1,
+                new_high_risk_queries: 0,
+                partition_filter_regressions: 0,
+                order_by_without_limit_regressions: 0,
+                possible_join_amplification_regressions: 0,
+                scan_cost_increase_files: 0,
+            },
+            files: vec![PrFileDelta {
+                path: "models/example.sql".to_string(),
+                previous_risk: "LOW".to_string(),
+                current_risk: "MEDIUM".to_string(),
+                risk_trend: "regressed".to_string(),
+                new_issues: vec!["SELECT_STAR".to_string()],
+                resolved_issues: vec![],
+                persistent_risk_factors: vec!["MISSING_WHERE".to_string()],
+                estimated_scan_from: "unknown".to_string(),
+                estimated_scan_to: "1.20 TB".to_string(),
+                scan_delta: "+1.20 TB".to_string(),
+            }],
+        };
+
+        let rendered = render_pr_review_markdown(&report);
+        assert!(rendered.contains("# SQL Inspect PR Review"));
+        assert!(rendered.contains("## `models/example.sql`"));
+        assert!(rendered.contains("**PR status:** **PASS**"));
+    }
+
+    #[test]
+    fn render_lineage_can_filter_to_single_column() {
+        let sql = "SELECT customer_id, SUM(amount) AS revenue FROM orders GROUP BY customer_id";
+        let rendered = render_lineage(Path::new("examples/revenue.sql"), sql, Some("revenue"));
+        assert!(rendered.contains("revenue"));
+        assert!(!rendered.contains("customer_id\n └─ customer_id"));
+    }
+
+    #[test]
+    fn render_risk_summary_is_compact() {
+        let report = super::build_risk_report(
+            Path::new("examples/query.sql"),
+            &[Finding {
+                rule_id: "SELECT_STAR".to_string(),
+                severity: Severity::High,
+                message: "SELECT *".to_string(),
+                why_it_matters: "Scans unnecessary columns".to_string(),
+                evidence: vec![],
+            }],
+            "2.30 TB".to_string(),
+        );
+
+        let rendered = render_risk_summary(&report);
+        assert!(rendered.contains("SQL Inspect Risk"));
+        assert!(rendered.contains("Risk: HIGH"));
+        assert!(rendered.contains("Top reasons:"));
     }
 
     #[test]

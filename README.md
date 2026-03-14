@@ -2,9 +2,9 @@
 
 Catch risky analytics SQL before it runs.
 
-`sql-inspect` scans SQL repositories, ranks the worst files first, reviews PRs for regressions, and highlights reliability and cost risks such as full table scans, wide joins, missing filters, and expensive query patterns.
+`sql-inspect` scans SQL repositories, ranks the worst files first, reviews pull requests for regressions, and highlights reliability and cost risks such as full table scans, wide joins, missing filters, and expensive query patterns before they merge.
 
-## Example
+## Quick Demo
 
 Input SQL:
 
@@ -35,17 +35,27 @@ o.customer_id
  └─ orders.customer_id
 ```
 
-## Why This Exists
+## Install
 
-SQL pipelines grow quickly and are hard to review.
+Prebuilt binary:
 
-When a metric looks wrong, teams need to:
+```bash
+curl -L -o sql-inspect.tar.gz https://github.com/kraftaa/sql-inspect/releases/download/v0.1.2/sql-inspect-macos-aarch64.tar.gz
+tar -xzf sql-inspect.tar.gz
+./sql-inspect --help
+```
 
-- trace where output columns come from
-- catch risky query patterns before they hit production
-- understand query intent quickly
+Homebrew:
 
-`sql-inspect` helps with deterministic checks and optional LLM explanations.
+```bash
+brew install kraftaa/tap/sql-inspect
+```
+
+Build from source:
+
+```bash
+cargo build
+```
 
 ## Features
 
@@ -59,6 +69,18 @@ When a metric looks wrong, teams need to:
 | Rule controls | Disable rules or override severity by `rule_id` |
 | Athena mode | Extra heuristics for partition/cost patterns |
 | CI thresholds | Fail on `low|medium|high` severity |
+
+## Why This Exists
+
+SQL pipelines grow quickly and are hard to review.
+
+When a metric looks wrong, teams need to:
+
+- trace where output columns come from
+- catch risky query patterns before they hit production
+- understand query intent quickly
+
+`sql-inspect` helps with deterministic checks and optional LLM explanations.
 
 ## Detect Risky SQL Patterns
 
@@ -103,12 +125,6 @@ dbt builds and runs transformation pipelines.
 
 They complement each other: dbt for orchestration/modeling, `sql-inspect` for query inspection.
 
-## Installation
-
-```bash
-cargo build
-```
-
 ## Distribution
 
 ### GitHub Releases (prebuilt binaries)
@@ -122,8 +138,8 @@ Tagging `v*` triggers `.github/workflows/release.yml` and publishes:
 Create a release tag:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 ### Homebrew tap
@@ -149,7 +165,9 @@ brew install kraftaa/tap/sql-inspect
 
 ```bash
 cargo run -- lineage <file.sql>
+cargo run -- lineage <file.sql> --column revenue
 cargo run -- risk <file.sql>
+cargo run -- risk <file.sql> --summary-only
 cargo run -- guard <file.sql> --max-risk high --deny-rule CROSS_JOIN
 cargo run -- simulate <file.sql> --limit 100
 cargo run -- tables <file.sql>
@@ -160,6 +178,8 @@ cargo run -- analyze <dir> --glob "*.sql" --changed-only --changed-base main
 cargo run -- analyze <dir> --glob "*.sql" --top 10
 cargo run -- analyze <dir> --glob "*.sql" --top 10 --verbose
 cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql"
+cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql" --ci
+cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql" --markdown
 ```
 
 ### PR review mode
@@ -171,6 +191,10 @@ cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql"
 Example output:
 
 ```text
+SQL Inspect PR Review
+Base: main
+Head: HEAD
+
 PR status: PASS
 
 No new SQL risk regressions detected.
@@ -190,6 +214,28 @@ Still risky because:
 - SELECT_STAR
 Estimated scan: unknown -> unknown
 Estimated scan delta: unknown
+```
+
+Compact CI mode:
+
+```bash
+cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql" --ci
+```
+
+```text
+PR status: PASS
+Changed SQL files: 1
+New HIGH-risk queries: 0
+Partition filter regressions: 0
+ORDER BY without LIMIT regressions: 0
+Join amplification regressions: 0
+Files with higher estimated scan: 0
+```
+
+Markdown mode for PR comments:
+
+```bash
+cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql" --markdown
 ```
 
 ### Repo scan summary
@@ -236,6 +282,7 @@ cargo run -- analyze . --glob "*.sql" --top 10 --verbose
 
 ```bash
 cargo run -- risk examples/bad_join.sql
+cargo run -- risk examples/bad_join.sql --summary-only
 cargo run -- risk examples/bad_join.sql --scan-tb 2.3
 cargo run -- risk examples/bad_join.sql --scan-bytes 2300000000000
 ```
@@ -251,6 +298,19 @@ Reasons:
 - missing where: No WHERE clause
 
 Estimated scan: 2.30 TB
+```
+
+Compact risk summary:
+
+```text
+SQL Inspect Risk
+File: examples/bad_join.sql
+Risk: HIGH
+Estimated scan: unknown
+Top reasons:
+- select star: SELECT *
+- missing where: No WHERE clause
+- full table scan likely: Likely full table scan
 ```
 
 Use one of:
@@ -303,6 +363,21 @@ Exit code is `2` when blocked, so this works directly in CI.
 
 ```bash
 cargo run -- simulate examples/query.sql --limit 100
+```
+
+### Column-specific lineage
+
+```bash
+cargo run -- lineage examples/revenue.sql --column revenue
+```
+
+Example output:
+
+```text
+examples/revenue.sql
+Projections:
+revenue
+ └─ SUM(orders.amount)
 ```
 
 ### Main Analyze Command (LLM + static)
