@@ -1,6 +1,8 @@
 # sql-inspect
 
-Static SQL analysis for reliability and cost risk.
+Catch risky analytics SQL before it runs.
+
+`sql-inspect` scans SQL repositories, ranks the worst files first, reviews PRs for regressions, and highlights reliability and cost risks such as full table scans, wide joins, missing filters, and expensive query patterns.
 
 ## Example
 
