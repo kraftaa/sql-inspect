@@ -65,6 +65,16 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         changed_only: bool,
     },
+    PrReview {
+        #[arg(long)]
+        base: String,
+        #[arg(long, default_value = "HEAD")]
+        head: String,
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        #[arg(long, default_value = "*.sql")]
+        glob: String,
+    },
 }
 
 #[derive(Parser, Debug)]
@@ -141,6 +151,32 @@ struct RiskReport {
     risk_score: String,
     reasons: Vec<String>,
     estimated_scan: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PrFileReport {
+    path: String,
+    previous_risk: String,
+    current_risk: String,
+    new_issues: Vec<String>,
+    removed_issues: Vec<String>,
+    estimated_scan_from: String,
+    estimated_scan_to: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PrSummaryReport {
+    changed_sql_files: usize,
+    new_high_risk_queries: usize,
+    partition_filter_regressions: usize,
+    order_by_without_limit_regressions: usize,
+    possible_join_amplification_regressions: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PrReviewReport {
+    summary: PrSummaryReport,
+    files: Vec<PrFileReport>,
 }
 
 fn env(name: &'static str) -> Result<String, AppError> {
@@ -621,6 +657,49 @@ fn collect_changed_sql_files(root: &Path, pattern: &str) -> anyhow::Result<Vec<P
     Ok(files)
 }
 
+fn collect_changed_sql_files_between_refs(
+    root: &Path,
+    pattern: &str,
+    base: &str,
+    head: &str,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let output = ProcessCommand::new("git")
+        .arg("diff")
+        .arg("--name-only")
+        .arg("--diff-filter=ACMRTUXB")
+        .arg(format!("{base}..{head}"))
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to run git diff for pr-review mode: {e}"))?;
+
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "git diff failed for pr-review mode: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let cwd = std::env::current_dir()?;
+    let root_abs = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        cwd.join(root)
+    };
+
+    let mut files = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let candidate = cwd.join(line);
+        if !candidate.starts_with(&root_abs) {
+            continue;
+        }
+        if matches_pattern(&candidate, pattern) {
+            files.push(candidate);
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
 fn collect_sql_files_recursive(
     root: &Path,
     pattern: &str,
@@ -1037,6 +1116,132 @@ fn render_folder_summary(
     out
 }
 
+fn read_file_at_ref(path: &Path, git_ref: &str) -> anyhow::Result<Option<String>> {
+    let cwd = std::env::current_dir()?;
+    let rel = path
+        .strip_prefix(&cwd)
+        .map_err(|_| anyhow::anyhow!("path {} is outside repository cwd", path.display()))?;
+    let rel_s = rel.to_string_lossy().replace('\\', "/");
+
+    let output = ProcessCommand::new("git")
+        .arg("show")
+        .arg(format!("{git_ref}:{rel_s}"))
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to run git show for {git_ref}:{rel_s}: {e}"))?;
+
+    if output.status.success() {
+        return Ok(Some(String::from_utf8_lossy(&output.stdout).to_string()));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    if stderr.contains("does not exist")
+        || stderr.contains("exists on disk, but not in")
+        || stderr.contains("pathspec")
+        || stderr.contains("fatal: invalid object name")
+    {
+        return Ok(None);
+    }
+
+    Err(anyhow::anyhow!(
+        "git show failed for {git_ref}:{rel_s}: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+fn finding_key(finding: &Finding) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        finding.rule_id,
+        severity_label(&finding.severity),
+        finding.message,
+        finding.evidence.join(";")
+    )
+}
+
+fn bytes_to_tb_label(bytes: Option<u64>) -> String {
+    match bytes {
+        Some(bytes) => format!("{:.2} TB", bytes as f64 / 1_000_000_000_000_f64),
+        None => "unknown".to_string(),
+    }
+}
+
+fn estimate_scan_bytes(args: &Args, sql: &str) -> anyhow::Result<Option<u64>> {
+    if let Some(tb) = args.scan_tb {
+        let bytes = (tb * 1_000_000_000_000_f64) as u64;
+        return Ok(Some(bytes));
+    }
+    if let Some(bytes) = args.scan_bytes {
+        return Ok(Some(bytes));
+    }
+    if let Some(bytes) = estimate_scan_from_stats_file(args, Some(sql))? {
+        return Ok(Some(bytes));
+    }
+    Ok(None)
+}
+
+fn has_rule(findings: &[Finding], rule_id: &str) -> bool {
+    findings.iter().any(|f| f.rule_id == rule_id)
+}
+
+fn render_pr_review(report: &PrReviewReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} changed SQL files\n",
+        report.summary.changed_sql_files
+    ));
+    out.push_str(&format!(
+        "{} new HIGH-risk queries\n",
+        report.summary.new_high_risk_queries
+    ));
+    out.push_str(&format!(
+        "{} query lost partition filter\n",
+        report.summary.partition_filter_regressions
+    ));
+    out.push_str(&format!(
+        "{} ORDER BY without LIMIT regressions\n",
+        report.summary.order_by_without_limit_regressions
+    ));
+    out.push_str(&format!(
+        "{} possible join amplification regressions\n",
+        report.summary.possible_join_amplification_regressions
+    ));
+
+    for file in &report.files {
+        out.push('\n');
+        out.push_str("File: ");
+        out.push_str(&file.path);
+        out.push('\n');
+        out.push_str("Previous risk: ");
+        out.push_str(&file.previous_risk);
+        out.push('\n');
+        out.push_str("Current risk: ");
+        out.push_str(&file.current_risk);
+        out.push('\n');
+        if !file.new_issues.is_empty() {
+            out.push_str("New issues:\n");
+            for issue in &file.new_issues {
+                out.push_str("- ");
+                out.push_str(issue);
+                out.push('\n');
+            }
+        }
+        if !file.removed_issues.is_empty() {
+            out.push_str("Removed issues:\n");
+            for issue in &file.removed_issues {
+                out.push_str("- ");
+                out.push_str(issue);
+                out.push('\n');
+            }
+        }
+        out.push_str("Estimated scan: ");
+        out.push_str(&file.estimated_scan_from);
+        out.push_str(" -> ");
+        out.push_str(&file.estimated_scan_to);
+        out.push('\n');
+    }
+    out
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
@@ -1151,6 +1356,116 @@ async fn main() -> Result<(), anyhow::Error> {
                 }
 
                 print!("{}", render_folder_summary(files.len(), &counts));
+                return Ok(());
+            }
+            Commands::PrReview {
+                base,
+                head,
+                dir,
+                glob,
+            } => {
+                let mut options = analysis_options(&config);
+                if let Some(dialect) = args.dialect {
+                    options.dialect = cli_dialect(dialect);
+                }
+
+                let files = collect_changed_sql_files_between_refs(dir, glob, base, head)?;
+                let mut file_reports = Vec::new();
+                let mut summary = PrSummaryReport {
+                    changed_sql_files: files.len(),
+                    new_high_risk_queries: 0,
+                    partition_filter_regressions: 0,
+                    order_by_without_limit_regressions: 0,
+                    possible_join_amplification_regressions: 0,
+                };
+
+                for file in files {
+                    let previous_sql = read_file_at_ref(&file, base)?;
+                    let current_sql = read_file_at_ref(&file, head)?;
+                    let Some(current_sql) = current_sql else {
+                        continue;
+                    };
+
+                    let previous = previous_sql
+                        .as_ref()
+                        .map(|sql| build_effective_static_explanation(sql, options, &config));
+                    let current =
+                        build_effective_static_explanation(&current_sql, options, &config);
+
+                    let previous_findings = previous
+                        .as_ref()
+                        .map(|p| p.findings.clone())
+                        .unwrap_or_default();
+                    let current_findings = current.findings.clone();
+
+                    let previous_keys: HashSet<String> =
+                        previous_findings.iter().map(finding_key).collect();
+                    let current_keys: HashSet<String> =
+                        current_findings.iter().map(finding_key).collect();
+
+                    let new_issues: Vec<String> = current_findings
+                        .iter()
+                        .filter(|f| !previous_keys.contains(&finding_key(f)))
+                        .map(|f| format!("{}: {}", f.rule_id, f.message))
+                        .collect();
+                    let removed_issues: Vec<String> = previous_findings
+                        .iter()
+                        .filter(|f| !current_keys.contains(&finding_key(f)))
+                        .map(|f| format!("{}: {}", f.rule_id, f.message))
+                        .collect();
+
+                    let prev_risk = risk_score(&previous_findings).to_string();
+                    let curr_risk = risk_score(&current_findings).to_string();
+                    let prev_rank = max_finding_severity(&previous_findings).rank();
+                    let curr_rank = max_finding_severity(&current_findings).rank();
+                    if curr_rank > prev_rank && curr_risk == "HIGH" {
+                        summary.new_high_risk_queries += 1;
+                    }
+
+                    if !has_rule(&previous_findings, "ATHENA_MISSING_PARTITION_FILTER")
+                        && has_rule(&current_findings, "ATHENA_MISSING_PARTITION_FILTER")
+                    {
+                        summary.partition_filter_regressions += 1;
+                    }
+                    if !has_rule(&previous_findings, "ATHENA_ORDER_BY_WITHOUT_LIMIT")
+                        && has_rule(&current_findings, "ATHENA_ORDER_BY_WITHOUT_LIMIT")
+                    {
+                        summary.order_by_without_limit_regressions += 1;
+                    }
+                    if !has_rule(&previous_findings, "POSSIBLE_CARTESIAN_JOIN")
+                        && has_rule(&current_findings, "POSSIBLE_CARTESIAN_JOIN")
+                    {
+                        summary.possible_join_amplification_regressions += 1;
+                    }
+
+                    let scan_from = previous_sql
+                        .as_ref()
+                        .map(|sql| estimate_scan_bytes(&args, sql))
+                        .transpose()?
+                        .flatten();
+                    let scan_to = estimate_scan_bytes(&args, &current_sql)?;
+
+                    file_reports.push(PrFileReport {
+                        path: file.display().to_string(),
+                        previous_risk: prev_risk,
+                        current_risk: curr_risk,
+                        new_issues,
+                        removed_issues,
+                        estimated_scan_from: bytes_to_tb_label(scan_from),
+                        estimated_scan_to: bytes_to_tb_label(scan_to),
+                    });
+                }
+
+                let report = PrReviewReport {
+                    summary,
+                    files: file_reports,
+                };
+
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", render_pr_review(&report));
+                }
                 return Ok(());
             }
         }
@@ -1310,6 +1625,24 @@ mod tests {
         ])
         .expect("simulate args should parse");
         assert!(matches!(args.command, Some(Commands::Simulate { .. })));
+    }
+
+    #[test]
+    fn args_parse_pr_review_subcommand() {
+        let args = Args::try_parse_from([
+            "sql-inspect",
+            "pr-review",
+            "--base",
+            "main",
+            "--head",
+            "HEAD",
+            "--dir",
+            "examples",
+            "--glob",
+            "*.sql",
+        ])
+        .expect("pr-review args should parse");
+        assert!(matches!(args.command, Some(Commands::PrReview { .. })));
     }
 
     #[test]

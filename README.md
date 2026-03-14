@@ -154,6 +154,23 @@ cargo run -- tables <file.sql>
 cargo run -- explain <file.sql>
 cargo run -- analyze <dir> --glob "*.sql"
 cargo run -- analyze <dir> --glob "*.sql" --changed-only
+cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql"
+```
+
+### PR review mode
+
+```bash
+cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql"
+```
+
+Example output:
+
+```text
+6 changed SQL files
+2 new HIGH-risk queries
+1 query lost partition filter
+1 ORDER BY without LIMIT regressions
+1 possible join amplification regressions
 ```
 
 ### Query Risk Scanner
