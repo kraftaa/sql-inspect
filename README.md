@@ -154,6 +154,80 @@ cargo run -- tables <file.sql>
 cargo run -- explain <file.sql>
 cargo run -- analyze <dir> --glob "*.sql"
 cargo run -- analyze <dir> --glob "*.sql" --changed-only
+cargo run -- analyze <dir> --glob "*.sql" --changed-only --changed-base main
+cargo run -- analyze <dir> --glob "*.sql" --top 10
+cargo run -- analyze <dir> --glob "*.sql" --top 10 --verbose
+cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql"
+```
+
+### PR review mode
+
+```bash
+cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql"
+```
+
+Example output:
+
+```text
+PR status: PASS
+
+No new SQL risk regressions detected.
+
+1 changed SQL file
+0 new HIGH-risk queries
+0 query lost partition filter
+0 ORDER BY without LIMIT regressions
+0 possible join amplification regressions
+0 files increased estimated scan cost
+
+File: models/example.sql
+Previous risk: HIGH
+Current risk: HIGH
+Risk trend: unchanged
+Still risky because:
+- SELECT_STAR
+Estimated scan: unknown -> unknown
+Estimated scan delta: unknown
+```
+
+### Repo scan summary
+
+`analyze` now highlights severity shape and hotspots, not only rule counts.
+
+Useful flags:
+
+- `--top <N>` number of hotspot files to display (default `5`)
+- `--changed-only` limit to changed files in working tree/staging
+- `--changed-base <ref>` (with `--changed-only`) limit to committed diff vs ref (for example `main`)
+
+Example:
+
+```text
+SQL Inspect Report
+Scope: current selection
+
+Analyzed 225 SQL files
+
+Top risks:
+1. 37 HIGH-risk files
+2. 117 files likely scan full tables
+3. 18 files have complex multi-join patterns
+4. 12 files contain CROSS JOIN or likely Cartesian behavior
+
+Severity shape:
+HIGH: 37 files
+MEDIUM: 88 files
+LOW: 100 files
+
+Most severe files:
+- models/a.sql  HIGH  SELECT_STAR, FULL_TABLE_SCAN_LIKELY
+- models/b.sql  HIGH  WIDE_JOIN_GRAPH, MISSING_WHERE
+```
+
+Verbose mode:
+
+```bash
+cargo run -- analyze . --glob "*.sql" --top 10 --verbose
 ```
 
 ### Query Risk Scanner
@@ -202,7 +276,26 @@ Example `stats.json`:
 cargo run -- guard examples/bad_join.sql --max-risk high --deny-rule CROSS_JOIN --deny-rule FULL_TABLE_SCAN_LIKELY
 ```
 
-Exit code is `1` when blocked, so this works directly in CI.
+Example output:
+
+```text
+SQL Inspect Guard
+Policy: default
+
+Status: FAIL
+Risk: HIGH
+
+Blocking violations
+- FULL_TABLE_SCAN_LIKELY
+- SELECT_STAR
+
+Why blocked
+This query shape is likely to scan most rows and can materially increase cost
+
+Exit code: 2
+```
+
+Exit code is `2` when blocked, so this works directly in CI.
 
 ### Simulate safer preview query
 

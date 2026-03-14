@@ -64,6 +64,22 @@ enum Commands {
         glob: String,
         #[arg(long, default_value_t = false)]
         changed_only: bool,
+        #[arg(long)]
+        changed_base: Option<String>,
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+        #[arg(long, default_value_t = false)]
+        verbose: bool,
+    },
+    PrReview {
+        #[arg(long)]
+        base: String,
+        #[arg(long, default_value = "HEAD")]
+        head: String,
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        #[arg(long, default_value = "*.sql")]
+        glob: String,
     },
 }
 
@@ -141,6 +157,73 @@ struct RiskReport {
     risk_score: String,
     reasons: Vec<String>,
     estimated_scan: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RepoSummary {
+    analyzed_files: usize,
+    high_files: usize,
+    medium_files: usize,
+    low_files: usize,
+    full_table_scan_files: usize,
+    multi_join_files: usize,
+    cartesian_files: usize,
+    top_files: Vec<RepoTopFile>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RepoTopFile {
+    path: String,
+    risk: String,
+    rules: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RepoVerboseFile {
+    path: String,
+    risk: String,
+    findings: Vec<String>,
+    reason: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PrReviewSummary {
+    status: String,
+    changed_sql_files: usize,
+    new_high_risk_queries: usize,
+    partition_filter_regressions: usize,
+    order_by_without_limit_regressions: usize,
+    possible_join_amplification_regressions: usize,
+    scan_cost_increase_files: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PrFileDelta {
+    path: String,
+    previous_risk: String,
+    current_risk: String,
+    risk_trend: String,
+    new_issues: Vec<String>,
+    resolved_issues: Vec<String>,
+    persistent_risk_factors: Vec<String>,
+    estimated_scan_from: String,
+    estimated_scan_to: String,
+    scan_delta: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PrReviewReport {
+    summary: PrReviewSummary,
+    files: Vec<PrFileDelta>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct GuardReport {
+    policy: String,
+    status: String,
+    risk: String,
+    blocking_violations: Vec<String>,
+    why_blocked: Option<String>,
 }
 
 fn env(name: &'static str) -> Result<String, AppError> {
@@ -621,6 +704,81 @@ fn collect_changed_sql_files(root: &Path, pattern: &str) -> anyhow::Result<Vec<P
     Ok(files)
 }
 
+fn collect_changed_sql_files_between_refs(
+    root: &Path,
+    pattern: &str,
+    base: &str,
+    head: &str,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let output = ProcessCommand::new("git")
+        .arg("diff")
+        .arg("--name-only")
+        .arg("--diff-filter=ACMRTUXB")
+        .arg(format!("{base}..{head}"))
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to run git diff for pr-review mode: {e}"))?;
+
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "git diff failed for pr-review mode: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let cwd = std::env::current_dir()?;
+    let root_abs = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        cwd.join(root)
+    };
+
+    let mut files = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let candidate = cwd.join(line);
+        if !candidate.starts_with(&root_abs) {
+            continue;
+        }
+        if candidate.is_file() && matches_pattern(&candidate, pattern) {
+            files.push(candidate);
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+fn read_file_at_ref(path: &Path, git_ref: &str) -> anyhow::Result<Option<String>> {
+    let cwd = std::env::current_dir()?;
+    let rel = path
+        .strip_prefix(&cwd)
+        .map_err(|_| anyhow::anyhow!("path {} is outside repository cwd", path.display()))?;
+    let rel_s = rel.to_string_lossy().replace('\\', "/");
+
+    let output = ProcessCommand::new("git")
+        .arg("show")
+        .arg(format!("{git_ref}:{rel_s}"))
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to run git show for {git_ref}:{rel_s}: {e}"))?;
+
+    if output.status.success() {
+        return Ok(Some(String::from_utf8_lossy(&output.stdout).to_string()));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    if stderr.contains("does not exist")
+        || stderr.contains("exists on disk, but not in")
+        || stderr.contains("pathspec")
+        || stderr.contains("fatal: invalid object name")
+    {
+        return Ok(None);
+    }
+
+    Err(anyhow::anyhow!(
+        "git show failed for {git_ref}:{rel_s}: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
 fn collect_sql_files_recursive(
     root: &Path,
     pattern: &str,
@@ -1020,12 +1178,54 @@ fn render_risk_report(report: &RiskReport) -> String {
     out
 }
 
-fn render_folder_summary(
-    file_count: usize,
+fn render_folder_summary_with_verbose(
+    summary: &RepoSummary,
     counts: &std::collections::BTreeMap<String, usize>,
+    verbose_files: &[RepoVerboseFile],
 ) -> String {
     let mut out = String::new();
-    out.push_str(&format!("Analyzed {} SQL files\n", file_count));
+    out.push_str("SQL Inspect Report\n");
+    out.push_str("Scope: current selection\n");
+    out.push('\n');
+    out.push_str(&format!("Analyzed {} SQL files\n", summary.analyzed_files));
+    out.push('\n');
+    out.push_str("Top risks:\n");
+    out.push_str(&format!("1. {} HIGH-risk files\n", summary.high_files));
+    out.push_str(&format!(
+        "2. {} files likely scan full tables\n",
+        summary.full_table_scan_files
+    ));
+    out.push_str(&format!(
+        "3. {} files have complex multi-join patterns\n",
+        summary.multi_join_files
+    ));
+    out.push_str(&format!(
+        "4. {} files contain CROSS JOIN or likely Cartesian behavior\n",
+        summary.cartesian_files
+    ));
+    out.push('\n');
+    out.push_str("Severity shape:\n");
+    out.push_str(&format!("HIGH: {} files\n", summary.high_files));
+    out.push_str(&format!("MEDIUM: {} files\n", summary.medium_files));
+    out.push_str(&format!("LOW: {} files\n", summary.low_files));
+    out.push('\n');
+    out.push_str("Most severe files:\n");
+    if summary.top_files.is_empty() {
+        out.push_str("- none\n");
+    } else {
+        for item in &summary.top_files {
+            out.push_str("- ");
+            out.push_str(&item.path);
+            out.push_str("  ");
+            out.push_str(&item.risk);
+            if !item.rules.is_empty() {
+                out.push_str("  ");
+                out.push_str(&item.rules.join(", "));
+            }
+            out.push('\n');
+        }
+    }
+    out.push('\n');
     out.push_str("Warnings:\n");
     if counts.is_empty() {
         out.push_str("- none\n");
@@ -1034,6 +1234,193 @@ fn render_folder_summary(
             out.push_str(&format!("- {} {}\n", count, rule));
         }
     }
+
+    if !verbose_files.is_empty() {
+        out.push('\n');
+        for file in verbose_files {
+            out.push_str("File: ");
+            out.push_str(&file.path);
+            out.push('\n');
+            out.push_str("Risk: ");
+            out.push_str(&file.risk);
+            out.push('\n');
+            out.push_str("Findings:\n");
+            for finding in &file.findings {
+                out.push_str("- ");
+                out.push_str(finding);
+                out.push('\n');
+            }
+            out.push_str("Reason:\n");
+            out.push_str(&file.reason);
+            out.push('\n');
+            out.push('\n');
+        }
+    }
+
+    out
+}
+
+fn bytes_to_tb_label(bytes: Option<u64>) -> String {
+    match bytes {
+        Some(bytes) => format!("{:.2} TB", bytes as f64 / 1_000_000_000_000_f64),
+        None => "unknown".to_string(),
+    }
+}
+
+fn estimate_scan_bytes(args: &Args, sql: &str) -> anyhow::Result<Option<u64>> {
+    if let Some(tb) = args.scan_tb {
+        return Ok(Some((tb * 1_000_000_000_000_f64) as u64));
+    }
+    if let Some(bytes) = args.scan_bytes {
+        return Ok(Some(bytes));
+    }
+    estimate_scan_from_stats_file(args, Some(sql))
+}
+
+fn has_rule(findings: &[Finding], rule_id: &str) -> bool {
+    findings.iter().any(|f| f.rule_id == rule_id)
+}
+
+fn risk_trend_label(prev: Severity, curr: Severity) -> &'static str {
+    if curr.rank() > prev.rank() {
+        "regressed"
+    } else if curr.rank() < prev.rank() {
+        "improved"
+    } else {
+        "unchanged"
+    }
+}
+
+fn scan_delta_label(from: Option<u64>, to: Option<u64>) -> String {
+    match (from, to) {
+        (Some(from), Some(to)) if to > from => {
+            format!("+{:.2} TB", (to - from) as f64 / 1_000_000_000_000_f64)
+        }
+        (Some(from), Some(to)) if to < from => {
+            format!("-{:.2} TB", (from - to) as f64 / 1_000_000_000_000_f64)
+        }
+        (Some(_), Some(_)) => "0.00 TB".to_string(),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn render_pr_review(report: &PrReviewReport) -> String {
+    let mut out = String::new();
+    out.push_str("SQL Inspect PR Review\n");
+    out.push_str("PR status: ");
+    out.push_str(&report.summary.status);
+    out.push_str("\n\n");
+    if report.summary.status == "PASS" {
+        out.push_str("No new SQL risk regressions detected.\n\n");
+    }
+    out.push_str(&format!(
+        "{} changed SQL files\n",
+        report.summary.changed_sql_files
+    ));
+    out.push_str(&format!(
+        "{} new HIGH-risk queries\n",
+        report.summary.new_high_risk_queries
+    ));
+    out.push_str(&format!(
+        "{} query lost partition filter\n",
+        report.summary.partition_filter_regressions
+    ));
+    out.push_str(&format!(
+        "{} ORDER BY without LIMIT regressions\n",
+        report.summary.order_by_without_limit_regressions
+    ));
+    out.push_str(&format!(
+        "{} possible join amplification regressions\n",
+        report.summary.possible_join_amplification_regressions
+    ));
+    out.push_str(&format!(
+        "{} files increased estimated scan cost\n",
+        report.summary.scan_cost_increase_files
+    ));
+
+    for file in &report.files {
+        out.push('\n');
+        out.push_str("File: ");
+        out.push_str(&file.path);
+        out.push('\n');
+        out.push_str("Previous risk: ");
+        out.push_str(&file.previous_risk);
+        out.push('\n');
+        out.push_str("Current risk: ");
+        out.push_str(&file.current_risk);
+        out.push('\n');
+        out.push_str("Risk trend: ");
+        out.push_str(&file.risk_trend);
+        out.push('\n');
+
+        if !file.new_issues.is_empty() {
+            out.push_str("New issues:\n");
+            for issue in &file.new_issues {
+                out.push_str("- ");
+                out.push_str(issue);
+                out.push('\n');
+            }
+        }
+        if !file.resolved_issues.is_empty() {
+            out.push_str("Resolved:\n");
+            for issue in &file.resolved_issues {
+                out.push_str("- ");
+                out.push_str(issue);
+                out.push('\n');
+            }
+        }
+        if !file.persistent_risk_factors.is_empty() {
+            out.push_str("Still risky because:\n");
+            for issue in &file.persistent_risk_factors {
+                out.push_str("- ");
+                out.push_str(issue);
+                out.push('\n');
+            }
+        }
+        out.push_str("Estimated scan: ");
+        out.push_str(&file.estimated_scan_from);
+        out.push_str(" -> ");
+        out.push_str(&file.estimated_scan_to);
+        out.push('\n');
+        out.push_str("Estimated scan delta: ");
+        out.push_str(&file.scan_delta);
+        out.push('\n');
+    }
+    out
+}
+
+fn render_guard_report(report: &GuardReport) -> String {
+    let mut out = String::new();
+    out.push_str("SQL Inspect Guard\n");
+    out.push_str("Policy: ");
+    out.push_str(&report.policy);
+    out.push_str("\n\n");
+    out.push_str("Status: ");
+    out.push_str(&report.status);
+    out.push('\n');
+    out.push_str("Risk: ");
+    out.push_str(&report.risk);
+    out.push_str("\n\n");
+
+    if report.blocking_violations.is_empty() {
+        out.push_str("No blocking violations found.\n");
+    } else {
+        out.push_str("Blocking violations\n");
+        for rule in &report.blocking_violations {
+            out.push_str("- ");
+            out.push_str(rule);
+            out.push('\n');
+        }
+        if let Some(reason) = &report.why_blocked {
+            out.push('\n');
+            out.push_str("Why blocked\n");
+            out.push_str(reason);
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str("Exit code: 2\n");
+    }
+
     out
 }
 
@@ -1081,29 +1468,66 @@ async fn main() -> Result<(), anyhow::Error> {
                 let parsed = build_effective_static_explanation(&sql, options, &config);
                 let block_reasons =
                     guard_block_reasons(&parsed.findings, to_severity(*max_risk), deny_rule);
+                let mut blocking_violations = parsed
+                    .findings
+                    .iter()
+                    .filter(|f| f.severity.rank() >= to_severity(*max_risk).rank())
+                    .map(|f| f.rule_id.clone())
+                    .collect::<Vec<_>>();
+                for reason in &block_reasons {
+                    if let Some(rest) = reason.strip_prefix("deny-rule matched ") {
+                        if let Some(rule) = rest.split_whitespace().next() {
+                            if !blocking_violations.iter().any(|r| r == rule) {
+                                blocking_violations.push(rule.to_string());
+                            }
+                        }
+                    }
+                }
+                blocking_violations.sort();
+                blocking_violations.dedup();
+                let report = GuardReport {
+                    policy: "default".to_string(),
+                    status: if blocking_violations.is_empty() {
+                        "PASS".to_string()
+                    } else {
+                        "FAIL".to_string()
+                    },
+                    risk: risk_score(&parsed.findings).to_string(),
+                    blocking_violations,
+                    why_blocked: if block_reasons.is_empty()
+                        && parsed
+                            .findings
+                            .iter()
+                            .all(|f| f.severity.rank() < to_severity(*max_risk).rank())
+                    {
+                        None
+                    } else {
+                        parsed
+                            .findings
+                            .iter()
+                            .max_by_key(|f| f.severity.rank())
+                            .map(|f| f.why_it_matters.clone())
+                    },
+                };
 
                 if args.json {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
                             "file": file.display().to_string(),
-                            "blocked": !block_reasons.is_empty(),
+                            "blocked": report.status == "FAIL",
                             "risk_score": risk_score(&parsed.findings),
                             "reasons": block_reasons,
-                            "findings": parsed.findings
+                            "findings": parsed.findings,
+                            "guard": report
                         }))?
                     );
-                } else if block_reasons.is_empty() {
-                    println!("ALLOW {}", file.display());
                 } else {
-                    println!("BLOCK {}", file.display());
-                    for reason in &block_reasons {
-                        println!("- {reason}");
-                    }
+                    print!("{}", render_guard_report(&report));
                 }
 
-                if !block_reasons.is_empty() {
-                    std::process::exit(1);
+                if report.status == "FAIL" {
+                    std::process::exit(2);
                 }
                 return Ok(());
             }
@@ -1127,30 +1551,266 @@ async fn main() -> Result<(), anyhow::Error> {
                 dir,
                 glob,
                 changed_only,
+                changed_base,
+                top,
+                verbose,
             } => {
                 let mut options = analysis_options(&config);
                 if let Some(dialect) = args.dialect {
                     options.dialect = cli_dialect(dialect);
                 }
                 let files = if *changed_only {
-                    collect_changed_sql_files(dir, glob)?
+                    if let Some(base) = changed_base {
+                        collect_changed_sql_files_between_refs(dir, glob, base, "HEAD")?
+                    } else {
+                        collect_changed_sql_files(dir, glob)?
+                    }
                 } else {
                     collect_sql_files(dir, glob)?
                 };
                 let mut counts = std::collections::BTreeMap::<String, usize>::new();
+                let mut high_files = 0usize;
+                let mut medium_files = 0usize;
+                let mut low_files = 0usize;
+                let mut full_scan_files = 0usize;
+                let mut multi_join_files = 0usize;
+                let mut cartesian_files = 0usize;
+                let mut offenders = Vec::<(PathBuf, Severity, Vec<String>)>::new();
+                let mut verbose_files = Vec::<RepoVerboseFile>::new();
 
                 for file in &files {
                     let sql = std::fs::read_to_string(file)?;
-                    let mut analysis = analyze_sql(&sql, options);
-                    apply_inline_suppressions_to_analysis(&mut analysis, &sql);
-                    let mut parsed = build_static_explanation(&analysis);
-                    apply_rule_controls(&mut parsed, &config);
+                    let parsed = build_effective_static_explanation(&sql, options, &config);
                     for finding in &parsed.findings {
                         *counts.entry(finding.rule_id.clone()).or_insert(0) += 1;
                     }
+                    let risk = max_finding_severity(&parsed.findings);
+                    match risk {
+                        Severity::High => high_files += 1,
+                        Severity::Medium => medium_files += 1,
+                        _ => low_files += 1,
+                    }
+                    if has_rule(&parsed.findings, "FULL_TABLE_SCAN_LIKELY") {
+                        full_scan_files += 1;
+                    }
+                    if has_rule(&parsed.findings, "MULTIPLE_JOINS")
+                        || has_rule(&parsed.findings, "WIDE_JOIN_GRAPH")
+                    {
+                        multi_join_files += 1;
+                    }
+                    if has_rule(&parsed.findings, "CROSS_JOIN")
+                        || has_rule(&parsed.findings, "POSSIBLE_CARTESIAN_JOIN")
+                    {
+                        cartesian_files += 1;
+                    }
+                    let rules = parsed
+                        .findings
+                        .iter()
+                        .map(|f| f.rule_id.clone())
+                        .collect::<Vec<_>>();
+                    offenders.push((file.clone(), risk.clone(), rules));
+                    if *verbose {
+                        let reason = parsed
+                            .findings
+                            .iter()
+                            .max_by_key(|f| f.severity.rank())
+                            .map(|f| f.why_it_matters.clone())
+                            .unwrap_or_else(|| "No obvious anti-patterns detected".to_string());
+                        verbose_files.push(RepoVerboseFile {
+                            path: file.display().to_string(),
+                            risk: severity_label(&risk).to_string(),
+                            findings: parsed.findings.iter().map(|f| f.rule_id.clone()).collect(),
+                            reason,
+                        });
+                    }
                 }
 
-                print!("{}", render_folder_summary(files.len(), &counts));
+                offenders.sort_by(|a, b| {
+                    b.1.rank()
+                        .cmp(&a.1.rank())
+                        .then_with(|| b.2.len().cmp(&a.2.len()))
+                });
+                let top_files = offenders
+                    .into_iter()
+                    .take(*top)
+                    .map(|(path, risk, rules)| RepoTopFile {
+                        path: path.display().to_string(),
+                        risk: severity_label(&risk).to_string(),
+                        rules,
+                    })
+                    .collect::<Vec<_>>();
+                let summary = RepoSummary {
+                    analyzed_files: files.len(),
+                    high_files,
+                    medium_files,
+                    low_files,
+                    full_table_scan_files: full_scan_files,
+                    multi_join_files,
+                    cartesian_files,
+                    top_files,
+                };
+
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "summary": summary,
+                            "warnings": counts,
+                            "verbose_files": verbose_files
+                        }))?
+                    );
+                } else {
+                    print!(
+                        "{}",
+                        render_folder_summary_with_verbose(&summary, &counts, &verbose_files)
+                    );
+                }
+                return Ok(());
+            }
+            Commands::PrReview {
+                base,
+                head,
+                dir,
+                glob,
+            } => {
+                let mut options = analysis_options(&config);
+                if let Some(dialect) = args.dialect {
+                    options.dialect = cli_dialect(dialect);
+                }
+                let files = collect_changed_sql_files_between_refs(dir, glob, base, head)?;
+                let mut reports = Vec::new();
+                let mut summary = PrReviewSummary {
+                    status: "PASS".to_string(),
+                    changed_sql_files: files.len(),
+                    new_high_risk_queries: 0,
+                    partition_filter_regressions: 0,
+                    order_by_without_limit_regressions: 0,
+                    possible_join_amplification_regressions: 0,
+                    scan_cost_increase_files: 0,
+                };
+
+                for file in files {
+                    let prev_sql = read_file_at_ref(&file, base)?;
+                    let curr_sql = read_file_at_ref(&file, head)?;
+                    let Some(curr_sql) = curr_sql else {
+                        continue;
+                    };
+
+                    let prev = prev_sql
+                        .as_deref()
+                        .map(|sql| build_effective_static_explanation(sql, options, &config));
+                    let curr = build_effective_static_explanation(&curr_sql, options, &config);
+
+                    let prev_findings = prev
+                        .as_ref()
+                        .map(|p| &p.findings)
+                        .cloned()
+                        .unwrap_or_default();
+                    let curr_findings = curr.findings.clone();
+
+                    let prev_rules: HashSet<String> =
+                        prev_findings.iter().map(|f| f.rule_id.clone()).collect();
+                    let curr_rules: HashSet<String> =
+                        curr_findings.iter().map(|f| f.rule_id.clone()).collect();
+
+                    let new_rules = curr_rules
+                        .difference(&prev_rules)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let resolved_rules = prev_rules
+                        .difference(&curr_rules)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let persistent_rules = curr_rules
+                        .intersection(&prev_rules)
+                        .cloned()
+                        .collect::<Vec<_>>();
+
+                    let prev_risk = max_finding_severity(&prev_findings);
+                    let curr_risk = max_finding_severity(&curr_findings);
+                    if curr_risk == Severity::High && prev_risk != Severity::High {
+                        summary.new_high_risk_queries += 1;
+                    }
+                    if !has_rule(&prev_findings, "ATHENA_MISSING_PARTITION_FILTER")
+                        && has_rule(&curr_findings, "ATHENA_MISSING_PARTITION_FILTER")
+                    {
+                        summary.partition_filter_regressions += 1;
+                    }
+                    if !has_rule(&prev_findings, "ATHENA_ORDER_BY_WITHOUT_LIMIT")
+                        && has_rule(&curr_findings, "ATHENA_ORDER_BY_WITHOUT_LIMIT")
+                    {
+                        summary.order_by_without_limit_regressions += 1;
+                    }
+                    if !has_rule(&prev_findings, "POSSIBLE_CARTESIAN_JOIN")
+                        && has_rule(&curr_findings, "POSSIBLE_CARTESIAN_JOIN")
+                    {
+                        summary.possible_join_amplification_regressions += 1;
+                    }
+
+                    let from_scan = prev_sql
+                        .as_deref()
+                        .map(|sql| estimate_scan_bytes(&args, sql))
+                        .transpose()?
+                        .flatten();
+                    let to_scan = estimate_scan_bytes(&args, &curr_sql)?;
+                    if let (Some(from), Some(to)) = (from_scan, to_scan) {
+                        if to > from {
+                            summary.scan_cost_increase_files += 1;
+                        }
+                    }
+
+                    reports.push(PrFileDelta {
+                        path: file.display().to_string(),
+                        previous_risk: severity_label(&prev_risk).to_string(),
+                        current_risk: severity_label(&curr_risk).to_string(),
+                        risk_trend: risk_trend_label(prev_risk, curr_risk).to_string(),
+                        new_issues: new_rules,
+                        resolved_issues: resolved_rules,
+                        persistent_risk_factors: persistent_rules,
+                        estimated_scan_from: bytes_to_tb_label(from_scan),
+                        estimated_scan_to: bytes_to_tb_label(to_scan),
+                        scan_delta: scan_delta_label(from_scan, to_scan),
+                    });
+                }
+
+                reports.sort_by(|a, b| {
+                    let a_rank = match a.current_risk.as_str() {
+                        "HIGH" => 3,
+                        "MEDIUM" => 2,
+                        "LOW" => 1,
+                        _ => 0,
+                    };
+                    let b_rank = match b.current_risk.as_str() {
+                        "HIGH" => 3,
+                        "MEDIUM" => 2,
+                        "LOW" => 1,
+                        _ => 0,
+                    };
+                    b_rank
+                        .cmp(&a_rank)
+                        .then_with(|| b.new_issues.len().cmp(&a.new_issues.len()))
+                });
+
+                let failed = summary.new_high_risk_queries > 0
+                    || summary.partition_filter_regressions > 0
+                    || summary.order_by_without_limit_regressions > 0
+                    || summary.possible_join_amplification_regressions > 0;
+                if failed {
+                    summary.status = "FAIL".to_string();
+                }
+
+                let report = PrReviewReport {
+                    summary,
+                    files: reports,
+                };
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", render_pr_review(&report));
+                }
+                if failed {
+                    std::process::exit(1);
+                }
                 return Ok(());
             }
         }
@@ -1247,9 +1907,10 @@ mod tests {
     use super::{
         apply_inline_suppressions_to_analysis, apply_rule_controls, collect_sql_files,
         extract_suppressed_rules, guard_block_reasons, matches_pattern, merge_static_analysis,
-        read_input, render_explanation, render_query_explanation, render_tables, risk_score,
-        should_fail, simulate_query, Args, Commands, DialectArg, InputMode, ProviderArg,
-        SeverityArg,
+        read_input, render_explanation, render_guard_report, render_pr_review,
+        render_query_explanation, render_tables, risk_score, should_fail, simulate_query, Args,
+        Commands, DialectArg, GuardReport, InputMode, PrFileDelta, PrReviewReport, PrReviewSummary,
+        ProviderArg, SeverityArg,
     };
     use clap::Parser;
     use sql_inspect::analyzer::{analyze_sql, AnalysisOptions};
@@ -1313,6 +1974,41 @@ mod tests {
     }
 
     #[test]
+    fn args_parse_pr_review_subcommand() {
+        let args = Args::try_parse_from([
+            "sql-inspect",
+            "pr-review",
+            "--base",
+            "main",
+            "--head",
+            "HEAD",
+            "--dir",
+            "models",
+            "--glob",
+            "*.sql",
+        ])
+        .expect("pr-review args should parse");
+        assert!(matches!(args.command, Some(Commands::PrReview { .. })));
+    }
+
+    #[test]
+    fn args_parse_analyze_with_verbose() {
+        let args = Args::try_parse_from([
+            "sql-inspect",
+            "analyze",
+            "examples",
+            "--glob",
+            "*.sql",
+            "--verbose",
+        ])
+        .expect("analyze verbose args should parse");
+        assert!(matches!(
+            args.command,
+            Some(Commands::Analyze { verbose: true, .. })
+        ));
+    }
+
+    #[test]
     fn args_parse_risk_with_scan_tb() {
         let args = Args::try_parse_from([
             "sql-inspect",
@@ -1361,6 +2057,47 @@ mod tests {
             args.command,
             Some(Commands::Analyze {
                 changed_only: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn args_parse_analyze_with_top() {
+        let args = Args::try_parse_from([
+            "sql-inspect",
+            "analyze",
+            "examples",
+            "--glob",
+            "*.sql",
+            "--top",
+            "10",
+        ])
+        .expect("args should parse");
+        assert!(matches!(
+            args.command,
+            Some(Commands::Analyze { top: 10, .. })
+        ));
+    }
+
+    #[test]
+    fn args_parse_analyze_with_changed_base() {
+        let args = Args::try_parse_from([
+            "sql-inspect",
+            "analyze",
+            "examples",
+            "--glob",
+            "*.sql",
+            "--changed-only",
+            "--changed-base",
+            "main",
+        ])
+        .expect("args should parse");
+        assert!(matches!(
+            args.command,
+            Some(Commands::Analyze {
+                changed_only: true,
+                changed_base: Some(_),
                 ..
             })
         ));
@@ -1725,6 +2462,57 @@ mod tests {
 
         let reasons = guard_block_reasons(&findings, Severity::Medium, &[]);
         assert!(!reasons.is_empty());
+    }
+
+    #[test]
+    fn render_pr_review_includes_pass_status() {
+        let report = PrReviewReport {
+            summary: PrReviewSummary {
+                status: "PASS".to_string(),
+                changed_sql_files: 1,
+                new_high_risk_queries: 0,
+                partition_filter_regressions: 0,
+                order_by_without_limit_regressions: 0,
+                possible_join_amplification_regressions: 0,
+                scan_cost_increase_files: 0,
+            },
+            files: vec![PrFileDelta {
+                path: "models/example.sql".to_string(),
+                previous_risk: "HIGH".to_string(),
+                current_risk: "HIGH".to_string(),
+                risk_trend: "unchanged".to_string(),
+                new_issues: vec![],
+                resolved_issues: vec![],
+                persistent_risk_factors: vec!["SELECT_STAR".to_string()],
+                estimated_scan_from: "unknown".to_string(),
+                estimated_scan_to: "unknown".to_string(),
+                scan_delta: "unknown".to_string(),
+            }],
+        };
+
+        let rendered = render_pr_review(&report);
+        assert!(rendered.contains("PR status: PASS"));
+        assert!(rendered.contains("Still risky because:"));
+    }
+
+    #[test]
+    fn render_guard_report_includes_fail_status() {
+        let report = GuardReport {
+            policy: "default".to_string(),
+            status: "FAIL".to_string(),
+            risk: "HIGH".to_string(),
+            blocking_violations: vec![
+                "FULL_TABLE_SCAN_LIKELY".to_string(),
+                "ORDER_BY_WITHOUT_LIMIT".to_string(),
+            ],
+            why_blocked: Some("Likely scans too much data".to_string()),
+        };
+
+        let rendered = render_guard_report(&report);
+        assert!(rendered.contains("SQL Inspect Guard"));
+        assert!(rendered.contains("Status: FAIL"));
+        assert!(rendered.contains("Blocking violations"));
+        assert!(rendered.contains("Exit code: 2"));
     }
 
     #[test]
