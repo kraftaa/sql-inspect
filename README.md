@@ -103,9 +103,35 @@ They complement each other: dbt for orchestration/modeling, `sql-inspect` for qu
 
 ## Installation
 
+### Install from source
+
 ```bash
 cargo build
 ```
+
+### Install prebuilt binary (v0.1.0)
+
+macOS (Apple Silicon):
+
+```bash
+curl -L -o sql-inspect.tar.gz https://github.com/kraftaa/sql-inspect/releases/download/v0.1.0/sql-inspect-macos-aarch64.tar.gz
+tar -xzf sql-inspect.tar.gz
+chmod +x sql-inspect
+sudo mv sql-inspect /usr/local/bin/sql-inspect
+sql-inspect --help
+```
+
+Linux (x86_64):
+
+```bash
+curl -L -o sql-inspect.tar.gz https://github.com/kraftaa/sql-inspect/releases/download/v0.1.0/sql-inspect-linux-x86_64.tar.gz
+tar -xzf sql-inspect.tar.gz
+chmod +x sql-inspect
+sudo mv sql-inspect /usr/local/bin/sql-inspect
+sql-inspect --help
+```
+
+Note: there is currently no published `pip` package. Use binary, Cargo, or Homebrew.
 
 ## Distribution
 
