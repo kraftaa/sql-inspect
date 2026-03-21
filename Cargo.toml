@@ -21,9 +21,6 @@ openai = []
 bedrock = ["aws-config", "aws-sdk-bedrockruntime"]
 local = []
 
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
-openssl = { version = "0.10", optional = true }
-
 [dependencies.aws-config]
 version = "1"
 optional = true
