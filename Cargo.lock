@@ -1996,6 +1996,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-bedrockruntime",
  "clap",
+ "openssl",
  "reqwest",
  "serde",
  "serde_json",

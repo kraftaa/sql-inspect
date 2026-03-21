@@ -4,10 +4,11 @@ use sql_inspect::config::{load_config, SqlInspectConfig};
 use sql_inspect::error::AppError;
 use sql_inspect::insights::{explain_query, extract_lineage_report, extract_tables};
 use sql_inspect::prompt::{build_prompt, parse_sql_explanation, Finding, Severity, SqlExplanation};
-use sql_inspect::providers::bedrock::BedrockProvider;
 use sql_inspect::providers::local::LocalProvider;
 use sql_inspect::providers::openai::OpenAIProvider;
 use sql_inspect::providers::LlmProvider;
+#[cfg(feature = "bedrock")]
+use sql_inspect::providers::bedrock::BedrockProvider;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -15,6 +16,7 @@ use std::process::Command as ProcessCommand;
 #[derive(ValueEnum, Clone, Debug)]
 enum ProviderArg {
     Openai,
+    #[cfg(feature = "bedrock")]
     Bedrock,
     Local,
 }
@@ -65,6 +67,12 @@ enum Commands {
     PgExplain {
         #[arg(long)]
         file: PathBuf,
+    },
+    PgExplainRun {
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        sql: Option<String>,
     },
     Analyze {
         dir: PathBuf,
@@ -628,6 +636,7 @@ async fn build_provider(args: &Args) -> Result<Box<dyn LlmProvider>, anyhow::Err
                 std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4.1-mini".to_string());
             Ok(Box::new(OpenAIProvider::new(key, model)))
         }
+        #[cfg(feature = "bedrock")]
         ProviderArg::Bedrock => {
             let model_id = env("BEDROCK_MODEL_ID")?;
             let provider = BedrockProvider::new(model_id).await?;
@@ -974,6 +983,19 @@ fn risk_score(findings: &[Finding]) -> &'static str {
     }
 }
 
+fn risk_impact_note(reasons: &[String]) -> String {
+    let mut note = String::new();
+    let joined = reasons.join(" ").to_ascii_lowercase();
+    if joined.contains("full table scan") || joined.contains("missing where") {
+        note = "Likely full table scan without selective filter".to_string();
+    } else if joined.contains("cartesian") || joined.contains("cross join") {
+        note = "Possible join explosion (row amplification)".to_string();
+    } else if joined.contains("select *") {
+        note = "Wide result set may increase scan and network cost".to_string();
+    }
+    note
+}
+
 fn estimated_scan_label(args: &Args, sql: Option<&str>) -> anyhow::Result<String> {
     if let Some(tb) = args.scan_tb {
         return Ok(format!("{tb:.2} TB"));
@@ -1264,6 +1286,13 @@ fn render_risk_report(report: &RiskReport) -> String {
         out.push_str(reason);
         out.push('\n');
     }
+    let impact = risk_impact_note(&report.reasons);
+    if !impact.is_empty() {
+        out.push('\n');
+        out.push_str("Impact: ");
+        out.push_str(&impact);
+        out.push('\n');
+    }
     out.push_str("\nEstimated scan: ");
     out.push_str(&report.estimated_scan);
     out.push('\n');
@@ -1282,6 +1311,12 @@ fn render_risk_summary(report: &RiskReport) -> String {
     out.push_str("Estimated scan: ");
     out.push_str(&report.estimated_scan);
     out.push('\n');
+    let impact = risk_impact_note(&report.reasons);
+    if !impact.is_empty() {
+        out.push_str("Impact: ");
+        out.push_str(&impact);
+        out.push('\n');
+    }
     out.push_str("Top reasons:\n");
     for reason in report.reasons.iter().take(3) {
         out.push_str("- ");
@@ -2012,6 +2047,54 @@ fn accumulate_buffers(plan: &serde_json::Value, buffers: &mut PgBuffers) {
         .unwrap_or(0);
 }
 
+fn run_pg_explain_via_psql(sql: &str) -> anyhow::Result<PgExplainSummary> {
+    // Require DATABASE_URL or standard PG envs to be set
+    let db_url = std::env::var("DATABASE_URL").ok();
+    let has_url = db_url.is_some();
+    let has_pg_host = std::env::var("PGHOST").is_ok();
+    if !has_url && !has_pg_host {
+        return Err(anyhow::anyhow!(
+            "Set DATABASE_URL or PGHOST/PGUSER/PGDATABASE env vars for pg-explain-run"
+        ));
+    }
+
+    let explain_sql = format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {sql}");
+    let mut cmd = ProcessCommand::new("psql");
+    if let Some(url) = db_url {
+        cmd.arg("-d").arg(url);
+    }
+    let output = cmd
+        .arg("-X")
+        .arg("-q")
+        .arg("-t")
+        .arg("-A")
+        .arg("-c")
+        .arg(&explain_sql)
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to execute psql: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("psql failed: {}", stderr.trim()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        return Err(anyhow::anyhow!("psql returned empty EXPLAIN output"));
+    }
+
+    parse_pg_explain_summary(&stdout)
+}
+
+fn validate_not_templated_sql(sql: &str) -> anyhow::Result<()> {
+    if sql.contains("{{") || sql.contains("{%") {
+        return Err(anyhow::anyhow!(
+            "Templated SQL detected (Jinja/dbt). Provide compiled SQL for pg-explain-run (e.g., dbt compile -> target/compiled/...sql)."
+        ));
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
@@ -2141,6 +2224,31 @@ async fn main() -> Result<(), anyhow::Error> {
                 let raw = std::fs::read_to_string(file)
                     .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", file.display()))?;
                 let summary = parse_pg_explain_summary(&raw)?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                } else {
+                    print!("{}", render_pg_explain(&summary));
+                }
+                return Ok(());
+            }
+            Commands::PgExplainRun { file, sql } => {
+                let sql_text = if let Some(path) = file {
+                    std::fs::read_to_string(path)
+                        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?
+                } else if let Some(sql) = sql {
+                    sql.clone()
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "Provide --file <sql.sql> or --sql \"...\" for pg-explain-run"
+                    ));
+                };
+
+                validate_not_templated_sql(&sql_text)?;
+
+                eprintln!(
+                    "Executing EXPLAIN (ANALYZE, BUFFERS) via psql; query will run on the database."
+                );
+                let summary = run_pg_explain_via_psql(&sql_text)?;
                 if args.json {
                     println!("{}", serde_json::to_string_pretty(&summary)?);
                 } else {
@@ -2542,8 +2650,8 @@ mod tests {
         render_lineage, render_pg_explain, render_pr_review, render_pr_review_ci,
         render_pr_review_cost_diff, render_pr_review_markdown, render_query_explanation,
         render_risk_summary, render_tables, risk_score, should_fail, simulate_query, Args,
-        Commands, DialectArg, GuardReport, InputMode, PrFileDelta,
-        PrReviewReport, PrReviewSummary, ProviderArg, SeverityArg,
+        Commands, DialectArg, GuardReport, InputMode, PrFileDelta, PrReviewReport, PrReviewSummary,
+        ProviderArg, SeverityArg,
     };
     use clap::Parser;
     use sql_inspect::analyzer::{analyze_sql, AnalysisOptions};
@@ -2701,6 +2809,13 @@ mod tests {
         let args = Args::try_parse_from(["sql-inspect", "pg-explain", "--file", "explain.json"])
             .expect("pg-explain args should parse");
         assert!(matches!(args.command, Some(Commands::PgExplain { .. })));
+    }
+
+    #[test]
+    fn args_parse_pg_explain_run_with_sql() {
+        let args = Args::try_parse_from(["sql-inspect", "pg-explain-run", "--sql", "select 1"])
+            .expect("pg-explain-run args should parse");
+        assert!(matches!(args.command, Some(Commands::PgExplainRun { .. })));
     }
 
     #[test]

@@ -104,3 +104,4 @@ mod tests {
             .contains("Unexpected Bedrock response shape"));
     }
 }
+#![cfg(feature = "bedrock")]

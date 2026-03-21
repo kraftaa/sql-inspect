@@ -55,6 +55,8 @@ Build from source:
 
 ```bash
 cargo build
+# enable AWS Bedrock provider if needed
+# cargo build --features bedrock
 ```
 
 ## Features
@@ -160,6 +162,8 @@ brew install kraftaa/tap/sql-inspect
 ```
 
 ## Usage
+
+Note: all analysis commands are static-only; they never execute your SQL against a database.
 
 ### Subcommands
 
