@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "sql-inspect"
-version = "0.1.7"
+version = "0.1.8"
 description = "SQL inspection CLI: static checks, lineage, PR review, cost diff"
 readme = "README.md"
 requires-python = ">=3.9"
