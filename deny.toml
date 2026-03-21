@@ -1,5 +1,6 @@
 [graph]
-all-features = true
+all-features = false
+features = ["default"]
 
 [advisories]
 yanked = "warn"
