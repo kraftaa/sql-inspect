@@ -147,10 +147,14 @@ struct Args {
     #[arg(long, global = true, conflicts_with = "scan_bytes")]
     scan_tb: Option<f64>,
 
-    #[arg(long, global = true)]
+    #[arg(
+        long,
+        global = true,
+        help = "Use a past Athena QueryExecutionId to pull DataScannedInBytes (post-run calibration; requires AWS creds/CLI)"
+    )]
     athena_query_execution_id: Option<String>,
 
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help = "AWS region for Athena lookup (optional)")]
     athena_region: Option<String>,
 
     #[arg(long, global = true)]
@@ -3334,7 +3338,8 @@ mod tests {
             Some("SELECT * FROM orders WHERE order_date >= DATE '2026-01-01'"),
         )
         .expect("label");
-        assert_eq!(label, "0.03 TB");
+        // With no partition metadata, we assume a partial scan (~70% of table bytes)
+        assert_eq!(label, "1.05 TB");
 
         std::fs::remove_file(path).expect("cleanup file");
         std::fs::remove_dir_all(dir).expect("cleanup dir");

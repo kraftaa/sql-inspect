@@ -61,7 +61,7 @@ cargo build
 
 Scan estimates (optional)
 
-- Athena: `querylens explain --athena-query-execution-id <id> --athena-region us-east-1 --file your.sql` (uses `aws athena get-query-execution` and your AWS creds).
+- Athena (post-run calibration): `querylens explain --athena-query-execution-id <id> --athena-region us-east-1 --file your.sql` uses `aws athena get-query-execution` to pull `DataScannedInBytes` from a past run. Use this to compare a real scan to our estimate or as the “before” value in PR cost diff. Not for brand-new queries.
 - Manual override: `--scan-tb 1.5` or `--scan-bytes 1500000000000`.
 - Table stats file (offline, no cloud calls): `--stats-file stats.json`
 
