@@ -1078,52 +1078,79 @@ fn estimate_scan_from_stats_file(args: &Args, sql: Option<&str>) -> anyhow::Resu
 
     let mut total = 0_u64;
     let mut matched = false;
+    let filters = extract_lineage_report(sql).filters;
+
     for table in tables {
-        if let Some(bytes) = lookup_table_bytes(&value, &table) {
-            total = total.saturating_add(bytes);
+        if let Some(stats) = parse_table_stats(&value, &table) {
+            if let Some(bytes) = stats.total_bytes {
+                let fraction = estimate_scan_fraction(&stats, &filters);
+                total = total.saturating_add((bytes as f64 * fraction) as u64);
+                matched = true;
+                continue;
+            }
+        }
+
+        // Fallback: accept bare bytes at top-level for the table
+        if let Some(bytes) = parse_bytes_value(
+            value
+                .get("tables")
+                .and_then(|v| v.get(&table))
+                .unwrap_or_else(|| value.get(&table).unwrap_or(&serde_json::Value::Null)),
+        ) {
+            let fraction = if filters.is_empty() { 1.0 } else { 0.7 };
+            total = total.saturating_add((bytes as f64 * fraction) as u64);
             matched = true;
         }
     }
 
     if matched {
-        let factor = stats_filter_factor(sql);
-        Ok(Some((total as f64 * factor) as u64))
+        Ok(Some(total))
     } else {
         Ok(None)
     }
 }
 
-fn stats_filter_factor(sql: &str) -> f64 {
-    let filters = extract_lineage_report(sql).filters;
-    if filters.is_empty() {
-        return 1.0;
-    }
-
-    let mut factor = 0.1_f64;
-    for filter in filters {
-        let lower = filter.to_ascii_lowercase();
-        if lower.contains("date")
-            || lower.contains("_at")
-            || lower.contains("timestamp")
-            || lower.contains("ds")
-            || lower.contains("partition")
-        {
-            factor = factor.min(0.02);
-        }
-    }
-
-    factor
+#[derive(Default)]
+struct TableStats {
+    total_bytes: Option<u64>,
+    row_count: Option<u64>,
+    partition_columns: Vec<String>,
+    partitions_per_year: Option<u32>,
 }
 
-fn lookup_table_bytes(value: &serde_json::Value, table: &str) -> Option<u64> {
-    let direct = value.get(table).and_then(parse_bytes_value);
-    if direct.is_some() {
-        return direct;
-    }
-    value
+fn parse_table_stats(root: &serde_json::Value, table: &str) -> Option<TableStats> {
+    let node = root
         .get("tables")
         .and_then(|v| v.get(table))
-        .and_then(parse_bytes_value)
+        .or_else(|| root.get(table))?;
+
+    let mut stats = TableStats::default();
+    stats.total_bytes = parse_bytes_value(node.get("total_bytes").unwrap_or(node));
+    stats.row_count = node
+        .get("row_count")
+        .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()));
+    stats.partition_columns = node
+        .get("partition_columns")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_ascii_lowercase()))
+                .collect()
+        })
+        .unwrap_or_default();
+    stats.partitions_per_year = node
+        .get("partitions_per_year")
+        .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+        .map(|n| n as u32);
+
+    if stats.total_bytes.is_none()
+        && stats.row_count.is_none()
+        && stats.partition_columns.is_empty()
+    {
+        None
+    } else {
+        Some(stats)
+    }
 }
 
 fn parse_bytes_value(value: &serde_json::Value) -> Option<u64> {
@@ -1137,6 +1164,40 @@ fn parse_bytes_value(value: &serde_json::Value) -> Option<u64> {
         v.as_u64()
             .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
     })
+}
+
+fn estimate_scan_fraction(stats: &TableStats, filters: &[String]) -> f64 {
+    if stats.partition_columns.is_empty() {
+        return if filters.is_empty() { 1.0 } else { 0.7 };
+    }
+
+    let filters_lower: Vec<String> = filters.iter().map(|f| f.to_ascii_lowercase()).collect();
+    let mut matches_partition = false;
+    for part in &stats.partition_columns {
+        if filters_lower.iter().any(|f| f.contains(part)) {
+            matches_partition = true;
+            break;
+        }
+    }
+
+    if matches_partition {
+        // If we see an obvious range, assume a small slice; otherwise even smaller.
+        let has_range = filters_lower
+            .iter()
+            .any(|f| f.contains("between") || f.contains(">") || f.contains("<"));
+        if let Some(parts) = stats.partitions_per_year {
+            // crude: assume daily partitions
+            let days = if has_range { 30.0 } else { 1.0 };
+            return (days / parts.max(1) as f64).clamp(0.01, 1.0);
+        }
+        return if has_range { 0.05 } else { 0.02 };
+    }
+
+    if filters.is_empty() {
+        1.0
+    } else {
+        0.7
+    }
 }
 
 fn guard_block_reasons(

@@ -59,6 +59,36 @@ cargo build
 # cargo build --features bedrock
 ```
 
+Scan estimates (optional)
+
+- Athena: `querylens explain --athena-query-execution-id <id> --athena-region us-east-1 --file your.sql` (uses `aws athena get-query-execution` and your AWS creds).
+- Manual override: `--scan-tb 1.5` or `--scan-bytes 1500000000000`.
+- Table stats file (offline, no cloud calls): `--stats-file stats.json`
+
+Example `stats.json`:
+
+```json
+{
+  "tables": {
+    "athena.sales": {
+      "total_bytes": 1200000000000,
+      "row_count": 3500000000,
+      "partition_columns": ["ds"],
+      "partitions_per_year": 365
+    },
+    "athena.customers": {
+      "total_bytes": 8000000000
+    }
+  }
+}
+```
+
+Heuristics:
+- No WHERE → assume full scan.
+- Filters on non-partition columns → ~0.7 of table size.
+- Equality/range on partition column → small slice (2–5% by default, or days/partitions if provided).
+- Sum per-table bytes to show “Estimated scan” and PR cost deltas.
+
 ## Features
 
 | Feature | Description |
